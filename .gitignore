@@ -1,0 +1,38 @@
+# Secrets — never commit
+*.key
+*.pem
+*.conf.local
+*-private.key
+wg-*.conf
+*.token
+*token*.txt
+.env
+.env.*
+secrets/
+local.properties
+
+# WireGuard generated configs (per-customer)
+provisioning/out/
+*.peer.conf
+
+# Android / Gradle
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+*.apk
+*.aab
+*.keystore
+*.jks
+
+# Node (provisioning service, if JS)
+node_modules/
+dist/
+npm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
