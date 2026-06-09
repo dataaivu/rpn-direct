@@ -34,6 +34,8 @@ anyway.
 ## Known infrastructure (do NOT put secrets in this repo)
 - **VPS hub:** `65.20.80.3` (`magicstreamer.duckdns.org`), Vultr. Currently also runs the
   Headscale/Headplane stack for the *other* app — be careful not to disrupt it.
+- **Admin GUI:** wg-portal v2 manages the `wgd0` hub via a web GUI (apex `:8443`, Google-OIDC
+  gated). Architecture in `server/wg-portal.md`; credentials live off-repo on the dev machine.
 - **Exit node:** Raspberry Pi, India, Airtel residential (~CGNAT). The genuine local IP is the
   whole product value.
 - Secrets (SSH, tokens, keys) live **outside** this repo on the dev machine. Never commit them.
