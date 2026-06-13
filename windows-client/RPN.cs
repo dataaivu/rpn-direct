@@ -266,10 +266,46 @@ namespace RpnApp
                 if (!File.Exists(ConfPath)) { await Task.Run(() => EnsureProvisioned()); }
                 await Task.Run(() => Run(WireGuard, "/installtunnelservice \"" + ConfPath + "\""));
                 for (int i = 0; i < 20 && !IsTunnelUp(); i++) await Task.Delay(400);
-                SetStatus(IsTunnelUp() ? "Connected" : "Connect failed", IsTunnelUp() ? Color.LimeGreen : Color.OrangeRed);
-                Log(IsTunnelUp() ? "Tunnel up." : "Tunnel did not start.");
+
+                if (!IsTunnelUp())
+                {
+                    Log("Tunnel service did not start — restoring normal networking.");
+                    await SafeDisconnect("tunnel did not start");
+                    SetStatus("Connect failed", Color.OrangeRed);
+                }
+                else
+                {
+                    // FAIL-OPEN GUARD. The config is full-tunnel (AllowedIPs 0.0.0.0/0),
+                    // which makes WireGuard-Windows install a kill switch that blocks all
+                    // non-tunnel traffic. If traffic isn't actually flowing through the Pi
+                    // exit, that would leave the user with NO internet — so we verify real
+                    // connectivity and auto-tear-down if it fails, restoring the connection.
+                    SetStatus("Verifying internet…", Color.Gold);
+                    Log("Tunnel up — verifying internet through the India exit…");
+                    bool ok = await Task.Run(() => InternetReachable(15000));
+                    if (ok)
+                    {
+                        SetStatus("Connected", Color.LimeGreen);
+                        Log("Internet verified through the tunnel.");
+                    }
+                    else
+                    {
+                        Log("No internet through the tunnel — auto-disconnecting to restore your connection.");
+                        await SafeDisconnect("internet unreachable through tunnel");
+                        SetStatus("Connect failed — internet restored", Color.OrangeRed);
+                        MessageBox.Show(
+                            "RPN couldn't reach the internet through the India exit, so it disconnected and " +
+                            "restored your normal connection.\n\nPlease try Connect again in a moment.",
+                            "RPN — connection not established", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    }
+                }
             }
-            catch (Exception ex) { SetStatus("Connect failed", Color.OrangeRed); Log("ERROR: " + ex.Message); }
+            catch (Exception ex)
+            {
+                Log("ERROR: " + ex.Message);
+                await SafeDisconnect("error during connect");   // never leave a half-up kill switch
+                SetStatus("Connect failed", Color.OrangeRed);
+            }
             SetButtons(true);
             await RefreshIp();
         }
@@ -278,16 +314,48 @@ namespace RpnApp
         {
             SetButtons(false);
             SetStatus("Disconnecting…", Color.Gold);
+            await SafeDisconnect("user request");
+            bool up = IsTunnelUp();
+            SetStatus(up ? "Disconnect failed" : "Disconnected", up ? Color.OrangeRed : Color.Gold);
+            Log(up ? "Tunnel still up." : "Tunnel down.");
+            SetButtons(true);
+            await RefreshIp();
+        }
+
+        // Always-safe teardown: removes the WireGuard tunnel service (and with it the
+        // kill-switch firewall rule), restoring normal networking. Never throws.
+        async Task SafeDisconnect(string reason)
+        {
             try
             {
                 await Task.Run(() => Run(WireGuard, "/uninstalltunnelservice " + TunnelName));
                 for (int i = 0; i < 20 && IsTunnelUp(); i++) await Task.Delay(400);
-                SetStatus("Disconnected", Color.Gold);
-                Log("Tunnel down.");
             }
-            catch (Exception ex) { SetStatus("Disconnect failed", Color.OrangeRed); Log("ERROR: " + ex.Message); }
-            SetButtons(true);
-            await RefreshIp();
+            catch (Exception ex) { Log("teardown note (" + reason + "): " + ex.Message); }
+        }
+
+        // Probe real connectivity. Under the full-tunnel kill switch this only succeeds
+        // if traffic genuinely egresses via the Pi, so it doubles as the fail-open guard.
+        // Retries for up to totalMs to allow for the WireGuard handshake to complete.
+        static bool InternetReachable(int totalMs)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < totalMs)
+            {
+                try
+                {
+                    var req = (HttpWebRequest)WebRequest.Create("https://api.ipify.org");
+                    req.Method = "GET"; req.Timeout = 4000; req.ReadWriteTimeout = 4000;
+                    using (var resp = (HttpWebResponse)req.GetResponse())
+                    using (var sr = new StreamReader(resp.GetResponseStream()))
+                    {
+                        if (sr.ReadToEnd().Trim().Length > 0) return true;
+                    }
+                }
+                catch { }
+                System.Threading.Thread.Sleep(1000);
+            }
+            return false;
         }
 
         async Task RefreshIp()
