@@ -1,0 +1,65 @@
+name: Build & Deploy Coordinator
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - 'coordinator/**'
+      - '.github/workflows/coordinator.yml'
+  workflow_dispatch:
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: coordinator
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Resolve modules
+        run: go mod tidy
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build linux/amd64 binary
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: 0
+        run: go build -ldflags="-s -w" -o rpn-coord ./...
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpn-coord-linux-amd64
+          path: coordinator/rpn-coord
+          if-no-files-found: error
+
+      - name: Deploy to VPS
+        env:
+          VPS_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$VPS_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H 65.20.80.3 >> ~/.ssh/known_hosts
+
+          # Copy binary
+          scp -i ~/.ssh/id_ed25519 rpn-coord root@65.20.80.3:/opt/rpn-coord/rpn-coord.new
+
+          # Atomic swap + restart
+          ssh -i ~/.ssh/id_ed25519 root@65.20.80.3 '
+            mv /opt/rpn-coord/rpn-coord.new /opt/rpn-coord/rpn-coord
+            chmod +x /opt/rpn-coord/rpn-coord
+            systemctl restart rpn-coord
+            sleep 2
+            systemctl is-active rpn-coord
+            curl -sf http://localhost:8089/healthz
+          '
