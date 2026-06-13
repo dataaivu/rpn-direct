@@ -63,6 +63,11 @@ def apply_peer(pubkey, ip):
     if pubkey not in conf:
         with open(WG_CONF, "a") as f:
             f.write(f"\n[Peer]\n# rpn-node {ip}\nPublicKey = {pubkey}\nAllowedIPs = {ip}/32\n")
+    # 3) exit policy route: traffic FROM this node -> table 5101 -> wgd0 -> Pi
+    subprocess.run(["ip", "route", "replace", "default", "dev", WG_IF, "table", TABLE], check=True)
+    rules = subprocess.run(["ip", "rule", "show"], capture_output=True, text=True).stdout
+    if f"from {ip} lookup {TABLE}" not in rules:
+        subprocess.run(["ip", "rule", "add", "from", ip, "lookup", TABLE], check=True)
 
 
 def remove_peer(pubkey):
@@ -102,11 +107,6 @@ def remove_peer(pubkey):
     with open(tmp, "w") as f:
         f.write("\n".join(out).rstrip("\n") + "\n")
     os.replace(tmp, WG_CONF)
-    # 3) exit policy route: traffic FROM this node -> table 5101 -> wgd0 -> Pi
-    subprocess.run(["ip", "route", "replace", "default", "dev", WG_IF, "table", TABLE], check=True)
-    rules = subprocess.run(["ip", "rule", "show"], capture_output=True, text=True).stdout
-    if f"from {ip} lookup {TABLE}" not in rules:
-        subprocess.run(["ip", "rule", "add", "from", ip, "lookup", TABLE], check=True)
 
 
 def find_by_device(peers, device_id):
