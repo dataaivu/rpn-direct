@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <AssemblyName>RPN</AssemblyName>
+    <RootNamespace>RpnApp</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <LangVersion>7.3</LangVersion>
+    <Deterministic>true</Deterministic>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <AssemblyTitle>RPN — India Exit</AssemblyTitle>
+    <Product>RPN</Product>
+    <Company>RPN</Company>
+    <Version>1.0.0</Version>
+    <FileVersion>1.0.0.0</FileVersion>
+    <!-- single self-contained exe: net48 runtime ships with Windows 10/11 -->
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
+
+  <!-- net48 reference assemblies, so the build never depends on a machine-installed
+       targeting pack (works on any GitHub runner). -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="System" />
+    <Reference Include="System.Drawing" />
+    <Reference Include="System.Windows.Forms" />
+    <Reference Include="System.ServiceProcess" />
+  </ItemGroup>
+
+  <!-- The WireGuard installer is embedded under the exact logical name RPN.cs loads. -->
+  <ItemGroup>
+    <EmbeddedResource Include="wireguard-amd64.msi">
+      <LogicalName>wireguard.msi</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+</Project>

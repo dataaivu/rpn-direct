@@ -1,0 +1,41 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ master, main ]
+    paths:
+      - 'windows-client/**'
+      - '.github/workflows/windows.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore windows-client/RPN.csproj
+
+      - name: Build RPN.exe
+        run: dotnet build windows-client/RPN.csproj -c Release --no-restore -p:ContinuousIntegrationBuild=true
+
+      - name: Show build output
+        shell: pwsh
+        run: |
+          Get-ChildItem windows-client/bin/Release | Format-Table Name,Length
+          $exe = "windows-client/bin/Release/RPN.exe"
+          if (!(Test-Path $exe)) { throw "RPN.exe not produced" }
+          "RPN.exe size: $((Get-Item $exe).Length) bytes"
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpn-windows-exe
+          path: windows-client/bin/Release/RPN.exe
+          if-no-files-found: error
