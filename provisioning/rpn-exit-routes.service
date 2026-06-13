@@ -1,0 +1,12 @@
+[Unit]
+Description=RPN Direct exit policy routes (re-apply provisioned nodes)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/rpn-provision/apply-routes.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
