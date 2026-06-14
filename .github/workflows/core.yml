@@ -75,7 +75,8 @@ jobs:
         run: go get golang.org/x/mobile/bind
 
       - name: Build .aar
-        run: gomobile bind -target=android/arm64,android/arm -o rpncore.aar ./mobile
+        # -androidapi 21 matches the app's minSdk; NDK 26 supports only 21..34.
+        run: gomobile bind -androidapi 21 -target=android/arm64,android/arm -o rpncore.aar ./mobile
 
       - name: Upload .aar
         uses: actions/upload-artifact@v4
