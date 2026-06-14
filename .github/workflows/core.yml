@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - 'core/**'
+      - 'coordinator/**'
       - '.github/workflows/core.yml'
   workflow_dispatch:
 
@@ -27,13 +28,34 @@ jobs:
       - name: Vet (compile-check the whole engine)
         run: go vet ./...
 
-      - name: Commit tidied go.mod/go.sum back
-        if: always()
-        run: |
-          git config user.name  "ci-bot"
-          git config user.email "ci@dataaivu"
-          git add go.mod go.sum 2>/dev/null || true
-          git diff --cached --quiet || echo "(go.mod/go.sum changed — tidy locally)"
+      - name: Build rpn-exit (Pi ARMv7)
+        env:
+          GOOS: linux
+          GOARCH: arm
+          GOARM: 7
+          CGO_ENABLED: 0
+        run: go build -ldflags="-s -w" -o rpn-exit ./cmd/rpn-exit
+
+      - name: Upload rpn-exit
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpn-exit-linux-arm7
+          path: core/rpn-exit
+          if-no-files-found: error
+
+  coordinator-vet:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: coordinator
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - run: go mod tidy
+      - name: Vet coordinator (offer/answer changes)
+        run: go vet ./...
 
   gomobile:
     runs-on: ubuntu-latest

@@ -164,7 +164,9 @@ func (h *sigHub) handleWS(w http.ResponseWriter, r *http.Request) {
 	// Validate: access code or fleet token
 	var network, role string
 	if hello.Role == RoleExit && hello.AccessCode == h.fleetToken {
-		network = "fleet"
+		// PoC: one shared network so exits and customers can see each other.
+		// (Per-network exit assignment is a later feature.)
+		network = "default"
 		role = RoleExit
 	} else {
 		// Customer: look up access code in DB
@@ -280,7 +282,12 @@ func (h *sigHub) readLoop(p *wsPeer) {
 		case TypeConnect:
 			var c Connect
 			if json.Unmarshal(env.Data, &c) == nil {
-				h.introduce(p, c.PeerPubKey)
+				h.offerToExit(p, c.PeerPubKey)
+			}
+		case TypeAnswer:
+			var a Answer
+			if json.Unmarshal(env.Data, &a) == nil {
+				h.answerToClient(p, a)
 			}
 		case TypeResult:
 			var res Result
@@ -325,27 +332,54 @@ func (h *sigHub) trySend(p *wsPeer, msg []byte) {
 	}
 }
 
-func (h *sigHub) introduce(p *wsPeer, targetPubKey string) {
+// offerToExit relays a client's connect request to its assigned exit, carrying
+// the client's per-session ICE credentials. The exit answers with its own.
+func (h *sigHub) offerToExit(client *wsPeer, exitPubKey string) {
 	h.mu.Lock()
-	target, ok := h.peers[targetPubKey]
-	if !ok || target.network != p.network {
+	exit, ok := h.peers[exitPubKey]
+	if !ok || exit.network != client.network {
+		h.mu.Unlock()
+		return
+	}
+	session := pairKey(client.info.PubKey, exit.info.PubKey)
+	offer, _ := encode(TypeOffer, Offer{
+		SessionID:    session,
+		ClientPubKey: client.info.PubKey,
+		ClientVPNIP:  client.info.VPNIP,
+		Ufrag:        client.info.Ufrag,
+		Pwd:          client.info.Pwd,
+		Candidates:   client.info.Candidates,
+	})
+	// Hand the client TURN creds up front so it has a relay fallback ready.
+	cUser, cPass := h.turnCreds(client.info.PubKey)
+	cRelay, _ := encode(TypeRelay, Relay{PeerPubKey: exit.info.PubKey, RelaySession: session, Username: cUser, Password: cPass})
+	h.trySend(exit, offer)
+	h.trySend(client, cRelay)
+	h.mu.Unlock()
+}
+
+// answerToClient relays the exit's per-session ICE credentials back to the
+// client as a Punch, so both sides start connectivity checks.
+func (h *sigHub) answerToClient(exit *wsPeer, a Answer) {
+	h.mu.Lock()
+	client, ok := h.peers[a.ClientPubKey]
+	if !ok || client.network != exit.network {
 		h.mu.Unlock()
 		return
 	}
 	at := time.Now().Add(500 * time.Millisecond).UnixMilli()
-	session := pairKey(p.info.PubKey, target.info.PubKey)
-
-	pUser, pPass := h.turnCreds(p.info.PubKey)
-	tUser, tPass := h.turnCreds(target.info.PubKey)
-	pRelay, _ := encode(TypeRelay, Relay{PeerPubKey: target.info.PubKey, RelaySession: session, Username: pUser, Password: pPass})
-	tRelay, _ := encode(TypeRelay, Relay{PeerPubKey: p.info.PubKey, RelaySession: session, Username: tUser, Password: tPass})
-	h.trySend(p, pRelay)
-	h.trySend(target, tRelay)
-
-	pPunch, _ := encode(TypePunch, Punch{PeerPubKey: target.info.PubKey, Candidates: target.info.Candidates, AtUnixMs: at, Ufrag: target.info.Ufrag, Pwd: target.info.Pwd})
-	tPunch, _ := encode(TypePunch, Punch{PeerPubKey: p.info.PubKey, Candidates: p.info.Candidates, AtUnixMs: at, Ufrag: p.info.Ufrag, Pwd: p.info.Pwd})
-	h.trySend(p, pPunch)
-	h.trySend(target, tPunch)
+	punch, _ := encode(TypePunch, Punch{
+		PeerPubKey: exit.info.PubKey,
+		Candidates: a.Candidates,
+		AtUnixMs:   at,
+		Ufrag:      a.Ufrag,
+		Pwd:        a.Pwd,
+	})
+	session := pairKey(client.info.PubKey, exit.info.PubKey)
+	eUser, ePass := h.turnCreds(exit.info.PubKey)
+	eRelay, _ := encode(TypeRelay, Relay{PeerPubKey: client.info.PubKey, RelaySession: session, Username: eUser, Password: ePass})
+	h.trySend(client, punch)
+	h.trySend(exit, eRelay)
 	h.mu.Unlock()
 }
 

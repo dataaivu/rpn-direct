@@ -31,13 +31,17 @@ import (
 	"golang.zx2c4.com/wireguard/tun"
 )
 
-// Config is the JSON passed to Start. Keys are WireGuard base64 keys.
+// Config is the JSON passed to Start/RunExit. Keys are WireGuard base64 keys.
 type Config struct {
 	WSURL      string `json:"wsURL"`      // coordinator control channel, e.g. ws://65.20.80.3:8089/ws
 	AccessCode string `json:"accessCode"` // customer access code (client) or fleet token (exit)
 	PrivateKey string `json:"privateKey"` // our WireGuard private key (base64)
 	Role       string `json:"role"`       // RoleClient | RoleExit
 	Name       string `json:"name"`
+
+	// Exit-only:
+	TunName string `json:"tunName"` // userspace tun device name, e.g. "rpn0"
+	HubCIDR string `json:"hubCIDR"` // the Pi's hub address, e.g. "10.100.0.2/24"
 }
 
 type engine struct {
@@ -46,7 +50,7 @@ type engine struct {
 	sig     *signaler
 	agent   *ice.Agent
 	dev     *device.Device
-	bind    *iceBind
+	bind    *multiBind
 	status  string
 	cancel  context.CancelFunc
 	running bool
@@ -241,14 +245,15 @@ func (e *engine) session(ctx context.Context, tunFd int, selfPub string) {
 	}
 }
 
-// awaitExitPeer polls the peer list until an exit with candidates appears.
+// awaitExitPeer polls the peer list until an exit appears. Candidates flow via
+// the offer/answer exchange, so we select by role alone.
 func (e *engine) awaitExitPeer(ctx context.Context) string {
 	deadline := time.After(15 * time.Second)
 	for {
 		select {
 		case peers := <-e.sig.peersCh:
 			for _, p := range peers {
-				if p.Role == RoleExit && len(p.Candidates) > 0 {
+				if p.Role == RoleExit {
 					return p.PubKey
 				}
 			}
@@ -265,7 +270,8 @@ func (e *engine) bringUpWireguard(tunFd int, selfPub, peerWGPub string, iceConn 
 	if err != nil {
 		return fmt.Errorf("tun from fd: %w", err)
 	}
-	bind := newIceBind(iceConn)
+	bind := newMultiBind()
+	bind.AddPeer(peerWGPub, iceConn)
 	e.bind = bind
 	dev := device.NewDevice(tdev, bind, device.NewLogger(device.LogLevelError, "rpn: "))
 	e.dev = dev
@@ -278,10 +284,11 @@ func (e *engine) bringUpWireguard(tunFd int, selfPub, peerWGPub string, iceConn 
 	if err != nil {
 		return err
 	}
-	// No endpoint= line: the bind is hard-wired to the single ICE conn.
+	// endpoint=<peer pubkey> tells the bind which ICE conn to use for this peer.
 	uapi := strings.Join([]string{
 		"private_key=" + privHex,
 		"public_key=" + peerHex,
+		"endpoint=" + peerWGPub,
 		"persistent_keepalive_interval=15",
 		"allowed_ip=0.0.0.0/0",
 		"",

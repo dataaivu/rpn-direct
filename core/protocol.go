@@ -15,6 +15,8 @@ const (
 	TypePunch     = "punch"
 	TypeResult    = "result"
 	TypeRelay     = "relay"
+	TypeOffer     = "offer"  // S->exit: a client wants in; carries the client's per-session ICE creds
+	TypeAnswer    = "answer" // exit->S: the exit's per-session ICE creds for that client
 	TypePing      = "ping"
 	TypePong      = "pong"
 )
@@ -108,4 +110,26 @@ type Relay struct {
 	RelaySession string `json:"relaySession"`
 	Username     string `json:"username"`
 	Password     string `json:"password"`
+}
+
+// Offer is sent by the coordinator to an exit when a client wants to connect.
+// It carries the client's per-session ICE credentials + candidates so the exit
+// can spin up a dedicated agent for that customer.
+type Offer struct {
+	SessionID    string      `json:"sessionID"`
+	ClientPubKey string      `json:"clientPubKey"`
+	ClientVPNIP  string      `json:"clientVPNIP"` // client's /32, for the exit's allowed_ips + routing
+	Ufrag        string      `json:"ufrag"`
+	Pwd          string      `json:"pwd"`
+	Candidates   []Candidate `json:"candidates"`
+}
+
+// Answer is the exit's reply: the per-session creds + candidates it minted for
+// that one client. The coordinator relays these to the client as a Punch.
+type Answer struct {
+	SessionID    string      `json:"sessionID"`
+	ClientPubKey string      `json:"clientPubKey"`
+	Ufrag        string      `json:"ufrag"`
+	Pwd          string      `json:"pwd"`
+	Candidates   []Candidate `json:"candidates"`
 }

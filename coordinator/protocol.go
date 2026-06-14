@@ -14,6 +14,8 @@ const (
 	TypePunch     = "punch"     // S->C  start simultaneous-open now
 	TypeResult    = "result"    // C->S  outcome of a punch attempt
 	TypeRelay     = "relay"     // S->C  fall back to the TURN relay (with credentials)
+	TypeOffer     = "offer"     // S->exit  a client wants in (carries client's ICE creds)
+	TypeAnswer    = "answer"    // exit->S  exit's per-session ICE creds for that client
 	TypePing      = "ping"      // bidi  keepalive
 	TypePong      = "pong"      // bidi  keepalive
 )
@@ -101,6 +103,26 @@ type Result struct {
 	OK         bool   `json:"ok"`
 	Via        string `json:"via"`  // "direct" | "relay"
 	Addr       string `json:"addr"` // the winning remote address
+}
+
+// Offer is relayed to an exit when a client asks to connect; it carries the
+// client's per-session ICE credentials so the exit can mint a dedicated agent.
+type Offer struct {
+	SessionID    string      `json:"sessionID"`
+	ClientPubKey string      `json:"clientPubKey"`
+	ClientVPNIP  string      `json:"clientVPNIP"`
+	Ufrag        string      `json:"ufrag"`
+	Pwd          string      `json:"pwd"`
+	Candidates   []Candidate `json:"candidates"`
+}
+
+// Answer is the exit's reply, relayed back to the client as a Punch.
+type Answer struct {
+	SessionID    string      `json:"sessionID"`
+	ClientPubKey string      `json:"clientPubKey"`
+	Ufrag        string      `json:"ufrag"`
+	Pwd          string      `json:"pwd"`
+	Candidates   []Candidate `json:"candidates"`
 }
 
 // Relay carries TURN allocation credentials so the peer can authenticate.

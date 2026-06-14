@@ -20,6 +20,7 @@ type signaler struct {
 	punchCh  chan Punch
 	relayCh  chan Relay
 	peersCh  chan []PeerInfo
+	offerCh  chan Offer
 	closed   bool
 	writeMu  sync.Mutex
 }
@@ -34,6 +35,7 @@ func dialSignaler(wsURL string) (*signaler, error) {
 		punchCh: make(chan Punch, 4),
 		relayCh: make(chan Relay, 4),
 		peersCh: make(chan []PeerInfo, 4),
+		offerCh: make(chan Offer, 16),
 	}
 	go s.readLoop()
 	return s, nil
@@ -74,7 +76,8 @@ func (s *signaler) sendEndpoints(e Endpoints) error { return s.send(TypeEndpoint
 func (s *signaler) connect(peerPubKey string) error {
 	return s.send(TypeConnect, Connect{PeerPubKey: peerPubKey})
 }
-func (s *signaler) result(r Result) error { return s.send(TypeResult, r) }
+func (s *signaler) result(r Result) error  { return s.send(TypeResult, r) }
+func (s *signaler) answer(a Answer) error  { return s.send(TypeAnswer, a) }
 
 func (s *signaler) readLoop() {
 	defer func() {
@@ -124,6 +127,14 @@ func (s *signaler) readLoop() {
 			if json.Unmarshal(env.Data, &r) == nil {
 				select {
 				case s.relayCh <- r:
+				default:
+				}
+			}
+		case TypeOffer:
+			var o Offer
+			if json.Unmarshal(env.Data, &o) == nil {
+				select {
+				case s.offerCh <- o:
 				default:
 				}
 			}
