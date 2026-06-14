@@ -2,7 +2,13 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Android 14+: a foreground service needs a typed permission. The VPN keep-alive
+         service isn't one of the system-defined types, so it declares special-use. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- Make the app installable on TV (no touchscreen) and on phones. -->
     <uses-feature android:name="android.software.leanback" android:required="false" />
@@ -26,7 +32,7 @@
             </intent-filter>
         </activity>
 
-        <!-- WireGuard userspace VpnService provided by the tunnel library. -->
+        <!-- WireGuard userspace VpnService provided by the tunnel library (owns the tun fd). -->
         <service
             android:name="com.wireguard.android.backend.GoBackend$VpnService"
             android:exported="false"
@@ -34,6 +40,17 @@
             <intent-filter>
                 <action android:name="android.net.VpnService" />
             </intent-filter>
+        </service>
+
+        <!-- Our foreground keep-alive service: owns the backend + wakelock, keeps the
+             process alive across screen-off / doze, and survives Activity teardown. -->
+        <service
+            android:name=".RpnService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="vpn_keepalive" />
         </service>
 
     </application>

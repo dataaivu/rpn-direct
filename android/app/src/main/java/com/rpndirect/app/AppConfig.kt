@@ -1,25 +1,40 @@
 package com.rpndirect.app
 
 /**
- * Phase-1 tunnel config for the Fire TV Cube test device.
+ * Runtime configuration for the direct-path client.
  *
- * NOTE: this is a TEST key issued by server/setup-wgd0.sh against the isolated wgd0
- * interface on the VPS. The repo is private; rotate this key before any real use.
- * Exit at this phase = the VPS's own IP. The Pi residential exit is wired in later.
+ * The client no longer ships a static WireGuard config. It:
+ *   1. Generates/loads its own WG keypair on device.
+ *   2. Discovers its public (NAT-mapped) endpoint via STUN, from the *same* UDP
+ *      port WireGuard will bind — so the mapping it reports is the one WG reuses.
+ *   3. Registers with the coordinator (access code + pubkey + endpoint) and gets
+ *      back the assigned Pi's pubkey + live endpoint + the customer's VPN /32.
+ *   4. Brings up a WireGuard tunnel that dials the Pi DIRECTLY — the VPS is only
+ *      involved in signaling, never in the data path.
+ *
+ * Direct works because the Pi's Airtel CGNAT is endpoint-independent (cone): once
+ * both sides send to each other's mapped endpoints, the port-restricted filter
+ * opens and WireGuard's own keepalives hold the path. See airtel-nat-punchable.
  */
 object AppConfig {
     const val TUNNEL_NAME = "rpndirect"
 
-    val WG_CONFIG = """
-        [Interface]
-        PrivateKey = MN0XRqTuVRcrzHBU+ZxUWh/Xqf/FFs3XprqK2+eKq0M=
-        Address = 10.99.0.101/32
-        DNS = 1.1.1.1
+    const val COORDINATOR_URL = "http://65.20.80.3:8089"
+    const val STUN_HOST = "65.20.80.3"
+    const val STUN_PORT = 3479
 
-        [Peer]
-        PublicKey = UvEK1hM6jkX1D0ngwkYdB/QlURB4nekJj/Rq01w/Glg=
-        Endpoint = 65.20.80.3:51820
-        AllowedIPs = 0.0.0.0/0
-        PersistentKeepalive = 25
-    """.trimIndent()
+    /**
+     * Fixed WireGuard listen port. STUN is queried from this exact port so the
+     * reflexive mapping we report to the coordinator matches the one WireGuard
+     * will reuse when it rebinds the port (endpoint-independent NAT keeps it).
+     */
+    const val WG_LISTEN_PORT = 51820
+
+    const val DNS = "1.1.1.1"
+
+    /**
+     * Per-install access code. Phase-1 placeholder — replace per device, or wire
+     * a first-run entry screen that stores it in SharedPreferences.
+     */
+    const val ACCESS_CODE = "REPLACE_WITH_ACCESS_CODE"
 }

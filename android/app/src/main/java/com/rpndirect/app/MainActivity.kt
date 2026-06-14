@@ -1,105 +1,91 @@
 package com.rpndirect.app
 
 import android.app.Activity
+import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
+import android.content.ServiceConnection
 import android.net.VpnService
 import android.os.Bundle
+import android.os.IBinder
 import android.widget.Button
 import android.widget.TextView
-import com.wireguard.android.backend.Backend
-import com.wireguard.android.backend.GoBackend
 import com.wireguard.android.backend.Tunnel
-import com.wireguard.config.Config
-import java.io.BufferedReader
-import java.io.StringReader
-import kotlin.concurrent.thread
 
 /**
- * Minimal from-scratch client: one Connect/Disconnect button that brings a plain
- * WireGuard tunnel to the VPS up and down. No Tailscale, no account, no UI framework.
+ * Thin UI. All tunnel state lives in [RpnService] (a foreground service), which
+ * outlives this Activity — so connect/disconnect survive the UI being destroyed.
  */
 class MainActivity : Activity() {
 
-    private lateinit var backend: Backend
-    private lateinit var statusView: TextView
-    private lateinit var toggleBtn: Button
-    private val tunnel = RpnTunnel()
+    private var svc: RpnService? = null
+    private lateinit var status: TextView
+    private lateinit var toggle: Button
+    private var pendingConnect = false
 
-    /** Tunnel handle the backend tracks; reports state changes back to the UI. */
-    private inner class RpnTunnel : Tunnel {
-        override fun getName(): String = AppConfig.TUNNEL_NAME
-        override fun onStateChange(newState: Tunnel.State) {
-            runOnUiThread { render(newState) }
+    private val conn = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, b: IBinder?) {
+            svc = (b as RpnService.LocalBinder).service
+            svc?.onState = { s -> runOnUiThread { render(s) } }
+            render(svc?.state() ?: Tunnel.State.DOWN)
+            if (pendingConnect) { pendingConnect = false; svc?.connect() }
         }
+        override fun onServiceDisconnected(name: ComponentName?) { svc = null }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
-        statusView = findViewById(R.id.status)
-        toggleBtn = findViewById(R.id.toggle)
-        backend = GoBackend(applicationContext)
-        toggleBtn.setOnClickListener { onToggle() }
-        toggleBtn.requestFocus()
-        render(currentState())
+        status = findViewById(R.id.status)
+        toggle = findViewById(R.id.toggle)
+        toggle.setOnClickListener { onToggle() }
+        toggle.requestFocus()
     }
 
-    private fun currentState(): Tunnel.State =
-        try { backend.getState(tunnel) } catch (e: Exception) { Tunnel.State.DOWN }
+    override fun onStart() {
+        super.onStart()
+        val i = Intent(this, RpnService::class.java)
+        startService(i)
+        bindService(i, conn, Context.BIND_AUTO_CREATE)
+    }
+
+    override fun onStop() {
+        super.onStop()
+        svc?.onState = null
+        try { unbindService(conn) } catch (_: Exception) {}
+    }
 
     private fun onToggle() {
-        val target =
-            if (currentState() == Tunnel.State.UP) Tunnel.State.DOWN else Tunnel.State.UP
-
+        val s = svc ?: return
+        if (s.state() == Tunnel.State.UP) { s.disconnect(); return }
         // Bringing the tunnel up needs the one-time VPN consent dialog.
-        if (target == Tunnel.State.UP) {
-            val prepare = VpnService.prepare(this)
-            if (prepare != null) {
-                startActivityForResult(prepare, REQ_VPN)
-                return
-            }
-        }
-        applyState(target)
+        val prepare = VpnService.prepare(this)
+        if (prepare != null) startActivityForResult(prepare, REQ_VPN) else s.connect()
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == REQ_VPN) {
-            if (resultCode == RESULT_OK) applyState(Tunnel.State.UP)
-            else statusView.text = getString(R.string.status_denied)
-        }
-    }
-
-    private fun applyState(target: Tunnel.State) {
-        statusView.text = getString(R.string.status_working)
-        toggleBtn.isEnabled = false
-        thread {
-            try {
-                val cfg = Config.parse(BufferedReader(StringReader(AppConfig.WG_CONFIG)))
-                backend.setState(tunnel, target, cfg)
-                val now = backend.getState(tunnel)
-                runOnUiThread {
-                    render(now)
-                    toggleBtn.isEnabled = true
-                }
-            } catch (e: Exception) {
-                runOnUiThread {
-                    statusView.text = getString(R.string.status_error, e.message ?: "unknown")
-                    toggleBtn.isEnabled = true
-                }
+            if (resultCode == RESULT_OK) {
+                if (svc != null) svc?.connect() else pendingConnect = true
+            } else {
+                status.text = getString(R.string.status_denied)
             }
         }
     }
 
     private fun render(state: Tunnel.State) {
         val up = state == Tunnel.State.UP
-        statusView.text =
-            getString(if (up) R.string.status_connected else R.string.status_disconnected)
-        toggleBtn.text =
-            getString(if (up) R.string.btn_disconnect else R.string.btn_connect)
+        val err = svc?.lastError
+        status.text = when {
+            svc?.connecting == true -> getString(R.string.status_working)
+            !up && err != null -> getString(R.string.status_error, err)
+            up -> getString(R.string.status_connected)
+            else -> getString(R.string.status_disconnected)
+        }
+        toggle.text = getString(if (up) R.string.btn_disconnect else R.string.btn_connect)
+        toggle.isEnabled = svc?.connecting != true
     }
 
-    private companion object {
-        const val REQ_VPN = 1001
-    }
+    private companion object { const val REQ_VPN = 1001 }
 }
