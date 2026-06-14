@@ -74,6 +74,9 @@ jobs:
       - name: Add gomobile bind dep
         run: go get golang.org/x/mobile/bind
 
+      - name: Upgrade anet (fix net.zoneCache linkname on Go 1.23+ android build)
+        run: go get github.com/wlynxg/anet@latest
+
       - name: Build .aar
         # -androidapi 21 matches the app's minSdk; NDK 26 supports only 21..34.
         run: gomobile bind -androidapi 21 -target=android/arm64,android/arm -o rpncore.aar ./mobile
