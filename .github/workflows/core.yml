@@ -62,20 +62,22 @@ jobs:
           sdkmanager "ndk;26.1.10909125" > /dev/null
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.1.10909125" >> "$GITHUB_ENV"
 
-      - name: Install gomobile
+      # Pin x/mobile to a Go-1.22-compatible revision. The @latest revision
+      # requires Go 1.25, and Go 1.23+ enforces the //go:linkname ban that breaks
+      # github.com/wlynxg/anet's reference to net.zoneCache during gomobile bind.
+      - name: Install gomobile (pinned)
+        env:
+          XMOBILE: v0.0.0-20240716161057-1ad2df20a8b6
         run: |
-          go install golang.org/x/mobile/cmd/gomobile@latest
-          go install golang.org/x/mobile/cmd/gobind@latest
+          go install golang.org/x/mobile/cmd/gomobile@$XMOBILE
+          go install golang.org/x/mobile/cmd/gobind@$XMOBILE
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: gomobile init
         run: gomobile init
 
-      - name: Add gomobile bind dep
-        run: go get golang.org/x/mobile/bind
-
-      - name: Upgrade anet (fix net.zoneCache linkname on Go 1.23+ android build)
-        run: go get github.com/wlynxg/anet@latest
+      - name: Pin x/mobile in the module (prevents the Go 1.25 upgrade)
+        run: go get golang.org/x/mobile@v0.0.0-20240716161057-1ad2df20a8b6
 
       - name: Build .aar
         # -androidapi 21 matches the app's minSdk; NDK 26 supports only 21..34.
