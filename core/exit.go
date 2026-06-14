@@ -115,9 +115,10 @@ func (e *exitEngine) serve(pub string) error {
 func (e *exitEngine) handleOffer(o Offer) {
 	urls := stunTurnURLs(e.sigWelcome())
 	agent, err := ice.NewAgent(&ice.AgentConfig{
-		Urls:           urls,
-		NetworkTypes:   []ice.NetworkType{ice.NetworkTypeUDP4},
-		CandidateTypes: []ice.CandidateType{ice.CandidateTypeHost, ice.CandidateTypeServerReflexive, ice.CandidateTypeRelay},
+		Urls:            urls,
+		NetworkTypes:    []ice.NetworkType{ice.NetworkTypeUDP4},
+		CandidateTypes:  []ice.CandidateType{ice.CandidateTypeHost, ice.CandidateTypeServerReflexive, ice.CandidateTypeRelay},
+		InterfaceFilter: iceInterfaceFilter,
 	})
 	if err != nil {
 		log.Printf("offer %s: agent: %v", short(o.ClientPubKey), err)

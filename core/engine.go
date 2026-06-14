@@ -141,9 +141,10 @@ func (e *engine) start(tunFd int) error {
 	// Build the ICE agent with STUN + TURN servers from the welcome.
 	urls := stunTurnURLs(welcome)
 	agent, err := ice.NewAgent(&ice.AgentConfig{
-		Urls:           urls,
-		NetworkTypes:   []ice.NetworkType{ice.NetworkTypeUDP4},
-		CandidateTypes: []ice.CandidateType{ice.CandidateTypeHost, ice.CandidateTypeServerReflexive, ice.CandidateTypeRelay},
+		Urls:            urls,
+		NetworkTypes:    []ice.NetworkType{ice.NetworkTypeUDP4},
+		CandidateTypes:  []ice.CandidateType{ice.CandidateTypeHost, ice.CandidateTypeServerReflexive, ice.CandidateTypeRelay},
+		InterfaceFilter: iceInterfaceFilter,
 	})
 	if err != nil {
 		return fmt.Errorf("ice agent: %w", err)
@@ -335,6 +336,23 @@ func (e *engine) stop() {
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
+
+// iceInterfaceFilter keeps only real, internet-facing interfaces. It excludes
+// loopback, container bridges, and every tunnel/VPN interface — critically the
+// existing wgd0 hub, tailscale0, and our own rpn0/rpncli0 tuns, which otherwise
+// pollute ICE with unreachable host candidates (or a routing loop) and cause the
+// agent to pick a dead pair and Fail. srflx (STUN) covers the real NAT mapping.
+func iceInterfaceFilter(name string) bool {
+	if name == "lo" {
+		return false
+	}
+	for _, p := range []string{"docker", "br-", "veth", "wgd", "rpn", "tailscale", "tun", "utun", "wg", "ts"} {
+		if strings.HasPrefix(name, p) {
+			return false
+		}
+	}
+	return true
+}
 
 func stunTurnURLs(w *Welcome) []*stun.URI {
 	var urls []*stun.URI
