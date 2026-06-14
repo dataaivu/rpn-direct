@@ -20,6 +20,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -237,6 +238,7 @@ func (e *engine) session(ctx context.Context, tunFd int, selfPub string) {
 		if pair.Local.Type() == ice.CandidateTypeRelay || pair.Remote.Type() == ice.CandidateTypeRelay {
 			via = "relay"
 		}
+		log.Printf("ICE selected pair: local=%s remote=%s via=%s", pair.Local.String(), pair.Remote.String(), via)
 	}
 	e.sig.result(Result{PeerPubKey: punch.PeerPubKey, OK: true, Via: via})
 	e.setStatus("up (" + via + ")")
@@ -280,7 +282,7 @@ func (e *engine) bringUpWireguard(tunFd int, selfPub, peerWGPub string, iceConn 
 	bind := newMultiBind()
 	bind.AddPeer(peerWGPub, iceConn)
 	e.bind = bind
-	dev := device.NewDevice(tdev, bind, device.NewLogger(device.LogLevelError, "rpn: "))
+	dev := device.NewDevice(tdev, bind, device.NewLogger(wgLogLevel(), "rpn: "))
 	e.dev = dev
 
 	privHex, err := keyB64ToHex(e.cfg.PrivateKey)

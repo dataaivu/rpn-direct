@@ -65,7 +65,7 @@ func (e *exitEngine) run() error {
 		return fmt.Errorf("configure tun: %w", err)
 	}
 	e.bind = newMultiBind()
-	e.dev = device.NewDevice(tdev, e.bind, device.NewLogger(device.LogLevelError, "rpn-exit: "))
+	e.dev = device.NewDevice(tdev, e.bind, device.NewLogger(wgLogLevel(), "rpn-exit: "))
 	if err := e.dev.IpcSet("private_key=" + privHex + "\n"); err != nil {
 		return fmt.Errorf("set private key: %w", err)
 	}

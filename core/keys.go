@@ -1,6 +1,24 @@
 package core
 
-import "golang.org/x/crypto/curve25519"
+import (
+	"os"
+
+	"golang.org/x/crypto/curve25519"
+	"golang.zx2c4.com/wireguard/device"
+)
+
+// wgLogLevel lets RPN_WG_LOG=verbose|error|silent control wireguard-go logging
+// without a rebuild. Defaults to error.
+func wgLogLevel() int {
+	switch os.Getenv("RPN_WG_LOG") {
+	case "verbose":
+		return device.LogLevelVerbose
+	case "silent":
+		return device.LogLevelSilent
+	default:
+		return device.LogLevelError
+	}
+}
 
 // short truncates a key/id for log lines.
 func short(s string) string {
