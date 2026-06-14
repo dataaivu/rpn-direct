@@ -162,7 +162,7 @@ class RpnService : VpnService() {
             @Suppress("DEPRECATION") Notification.Builder(this)
         return b.setContentTitle("RPN Direct")
             .setContentText("Tunnel active")
-            .setSmallIcon(android.R.drawable.stat_sys_vpn_ind)
+            .setSmallIcon(R.drawable.banner)
             .setOngoing(true)
             .build()
     }

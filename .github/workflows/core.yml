@@ -56,6 +56,18 @@ jobs:
       - run: go mod tidy
       - name: Vet coordinator (offer/answer changes)
         run: go vet ./...
+      - name: Build coordinator (linux/amd64)
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: 0
+        run: go build -ldflags="-s -w" -o rpn-coord ./...
+      - name: Upload coordinator binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpn-coord-linux-amd64
+          path: coordinator/rpn-coord
+          if-no-files-found: error
 
   gomobile:
     runs-on: ubuntu-latest
