@@ -149,6 +149,12 @@ func (e *engine) start(tunFd int) error {
 		return fmt.Errorf("ice agent: %w", err)
 	}
 	e.agent = agent
+	agent.OnConnectionStateChange(func(s ice.ConnectionState) {
+		log.Printf("ICE connection state: %s", s)
+	})
+	agent.OnSelectedCandidatePairChange(func(local, remote ice.Candidate) {
+		log.Printf("ICE pair changed: local=%s remote=%s", local.String(), remote.String())
+	})
 
 	localUfrag, localPwd, err := agent.GetLocalUserCredentials()
 	if err != nil {

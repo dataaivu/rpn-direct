@@ -1,6 +1,7 @@
 package core
 
 import (
+	"log"
 	"net"
 	"net/netip"
 	"sync"
@@ -72,10 +73,16 @@ func (b *multiBind) RemovePeer(id string) {
 
 func (b *multiBind) readPeer(bp *boundPeer) {
 	buf := make([]byte, 1500)
+	count := 0
 	for {
 		n, err := bp.conn.Read(buf)
 		if err != nil {
+			log.Printf("readPeer %s: closed after %d pkts: %v", short(bp.id), count, err)
 			return
+		}
+		count++
+		if count == 1 {
+			log.Printf("readPeer %s: first inbound packet (%d bytes)", short(bp.id), n)
 		}
 		pkt := make([]byte, n)
 		copy(pkt, buf[:n])

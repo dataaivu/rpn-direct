@@ -113,9 +113,6 @@ func (e *exitEngine) serve(pub string) error {
 
 // handleOffer runs one customer's ICE session and adds them as a WireGuard peer.
 func (e *exitEngine) handleOffer(o Offer) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
 	urls := stunTurnURLs(e.sigWelcome())
 	agent, err := ice.NewAgent(&ice.AgentConfig{
 		Urls:           urls,
@@ -126,6 +123,9 @@ func (e *exitEngine) handleOffer(o Offer) {
 		log.Printf("offer %s: agent: %v", short(o.ClientPubKey), err)
 		return
 	}
+	agent.OnConnectionStateChange(func(s ice.ConnectionState) {
+		log.Printf("exit ICE state (%s): %s", short(o.ClientPubKey), s)
+	})
 	e.mu.Lock()
 	if old := e.sessions[o.ClientPubKey]; old != nil {
 		old.Close()
@@ -175,8 +175,11 @@ func (e *exitEngine) handleOffer(o Offer) {
 		Candidates:   cands,
 	})
 
-	// The exit is the controlled side: Accept.
-	conn, err := agent.Accept(ctx, o.Ufrag, o.Pwd)
+	// The exit is the controlled side: Accept. Bound the establishment with a
+	// timeout, but cancel only the timer — the returned conn lives independently.
+	acceptCtx, acceptCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	conn, err := agent.Accept(acceptCtx, o.Ufrag, o.Pwd)
+	acceptCancel()
 	if err != nil {
 		log.Printf("offer %s: accept: %v", short(o.ClientPubKey), err)
 		return
