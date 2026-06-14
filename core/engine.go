@@ -48,10 +48,11 @@ type engine struct {
 	mu      sync.Mutex
 	cfg     Config
 	sig     *signaler
-	agent   *ice.Agent
-	dev     *device.Device
-	bind    *multiBind
-	status  string
+	agent     *ice.Agent
+	dev       *device.Device
+	bind      *multiBind
+	nativeTun tun.Device // set for headless native clients; nil on Android (uses fd)
+	status    string
 	cancel  context.CancelFunc
 	running bool
 }
@@ -266,9 +267,15 @@ func (e *engine) awaitExitPeer(ctx context.Context) string {
 }
 
 func (e *engine) bringUpWireguard(tunFd int, selfPub, peerWGPub string, iceConn *ice.Conn) error {
-	tdev, _, err := tun.CreateUnmonitoredTUNFromFD(tunFd)
-	if err != nil {
-		return fmt.Errorf("tun from fd: %w", err)
+	var tdev tun.Device
+	if e.nativeTun != nil {
+		tdev = e.nativeTun
+	} else {
+		d, _, err := tun.CreateUnmonitoredTUNFromFD(tunFd)
+		if err != nil {
+			return fmt.Errorf("tun from fd: %w", err)
+		}
+		tdev = d
 	}
 	bind := newMultiBind()
 	bind.AddPeer(peerWGPub, iceConn)

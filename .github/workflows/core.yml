@@ -43,6 +43,20 @@ jobs:
           path: core/rpn-exit
           if-no-files-found: error
 
+      - name: Build rpn-client (linux/amd64, for validation)
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: 0
+        run: go build -ldflags="-s -w" -o rpn-client ./cmd/rpn-client
+
+      - name: Upload rpn-client
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpn-client-linux-amd64
+          path: core/rpn-client
+          if-no-files-found: error
+
   coordinator-vet:
     runs-on: ubuntu-latest
     defaults:
