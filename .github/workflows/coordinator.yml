@@ -45,6 +45,7 @@ jobs:
       - name: Deploy to VPS
         env:
           VPS_KEY: ${{ secrets.VPS_SSH_KEY }}
+          TURN_SECRET: ${{ secrets.RPN_TURN_SECRET }}
         run: |
           mkdir -p ~/.ssh
           echo "$VPS_KEY" > ~/.ssh/id_ed25519
@@ -54,12 +55,23 @@ jobs:
           # Copy binary
           scp -i ~/.ssh/id_ed25519 rpn-coord root@65.20.80.3:/opt/rpn-coord/rpn-coord.new
 
-          # Atomic swap + restart
-          ssh -i ~/.ssh/id_ed25519 root@65.20.80.3 '
+          # Atomic swap, open new ports, restart
+          ssh -i ~/.ssh/id_ed25519 root@65.20.80.3 "
             mv /opt/rpn-coord/rpn-coord.new /opt/rpn-coord/rpn-coord
             chmod +x /opt/rpn-coord/rpn-coord
+
+            # Open secondary STUN port (RFC 5780 dual-port NAT classification)
+            ufw allow 3481/udp comment 'rpn-coord STUN2 (RFC 5780)' 2>/dev/null || true
+
+            # Persist TURN secret to env file read by the systemd unit.
+            # The unit must have EnvironmentFile=/opt/rpn-coord/env
+            if [ -n '$TURN_SECRET' ]; then
+              echo 'TURN_SECRET=$TURN_SECRET' > /opt/rpn-coord/env
+              chmod 600 /opt/rpn-coord/env
+            fi
+
             systemctl restart rpn-coord
             sleep 2
             systemctl is-active rpn-coord
             curl -sf http://localhost:8089/healthz
-          '
+          "

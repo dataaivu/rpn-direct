@@ -55,7 +55,7 @@ jobs:
           # Copy binary to VPS, then forward to Pi over the WireGuard tunnel
           scp -i ~/.ssh/id_ed25519 rpn-agent root@65.20.80.3:/tmp/rpn-agent
 
-          # Trust the Pi host key via VPS (Pi not directly reachable from internet)
+          # Trust the Pi host key via VPS (Pi is not directly reachable from internet)
           ssh -i ~/.ssh/id_ed25519 root@65.20.80.3 'ssh-keyscan -H 10.99.0.2 >> ~/.ssh/known_hosts 2>/dev/null; echo ok'
 
           ssh -i ~/.ssh/id_ed25519 root@65.20.80.3 '
@@ -66,5 +66,6 @@ jobs:
               systemctl restart rpn-agent
               sleep 2
               systemctl is-active rpn-agent
+              curl -sf http://localhost:8090/healthz
             "
           '

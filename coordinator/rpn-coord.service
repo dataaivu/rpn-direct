@@ -1,0 +1,34 @@
+[Unit]
+Description=RPN Direct coordinator (WSS + STUN + TURN)
+After=network.target wg-quick@wgd0.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/rpn-coord
+
+# TURN_SECRET must be set here — never commit it.
+# Populate /opt/rpn-coord/env with: TURN_SECRET=<random-secret>
+# The CI deploy step writes this from the RPN_TURN_SECRET GitHub secret.
+EnvironmentFile=/opt/rpn-coord/env
+
+ExecStart=/opt/rpn-coord/rpn-coord \
+    -http       :8089 \
+    -stun       :3479 \
+    -stun2      :3481 \
+    -turn       :3480 \
+    -public-ip  65.20.80.3 \
+    -stun-public  65.20.80.3:3479 \
+    -stun2-public 65.20.80.3:3481 \
+    -relay-public 65.20.80.3:3480 \
+    -turn-secret  ${TURN_SECRET} \
+    -state-file /opt/rpn-coord/state.json \
+    -wg-iface   wgd0
+
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
