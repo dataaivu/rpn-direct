@@ -44,32 +44,39 @@ jobs:
 
       - name: Deploy to VPS
         env:
-          VPS_KEY: ${{ secrets.VPS_SSH_KEY }}
-          TURN_SECRET: ${{ secrets.RPN_TURN_SECRET }}
+          VPS_KEY:      ${{ secrets.VPS_SSH_KEY }}
+          TURN_SECRET:  ${{ secrets.RPN_TURN_SECRET }}
+          FLEET_TOKEN:  ${{ secrets.RPN_FLEET_TOKEN }}
+          ADMIN_TOKEN:  ${{ secrets.RPN_ADMIN_TOKEN }}
         run: |
           mkdir -p ~/.ssh
           echo "$VPS_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H 65.20.80.3 >> ~/.ssh/known_hosts
 
-          # Copy binary
           scp -i ~/.ssh/id_ed25519 rpn-coord root@65.20.80.3:/opt/rpn-coord/rpn-coord.new
+          scp -i ~/.ssh/id_ed25519 rpn-coord.service root@65.20.80.3:/etc/systemd/system/rpn-coord.service
 
-          # Atomic swap, open new ports, restart
           ssh -i ~/.ssh/id_ed25519 root@65.20.80.3 "
             mv /opt/rpn-coord/rpn-coord.new /opt/rpn-coord/rpn-coord
             chmod +x /opt/rpn-coord/rpn-coord
 
-            # Open secondary STUN port (RFC 5780 dual-port NAT classification)
-            ufw allow 3481/udp comment 'rpn-coord STUN2 (RFC 5780)' 2>/dev/null || true
+            # Write secrets env file (chmod 600 — root only)
+            cat > /opt/rpn-coord/env << 'ENVEOF'
+TURN_SECRET=$TURN_SECRET
+FLEET_TOKEN=$FLEET_TOKEN
+ADMIN_TOKEN=$ADMIN_TOKEN
+ENVEOF
+            chmod 600 /opt/rpn-coord/env
 
-            # Persist TURN secret to env file read by the systemd unit.
-            # The unit must have EnvironmentFile=/opt/rpn-coord/env
-            if [ -n '$TURN_SECRET' ]; then
-              echo 'TURN_SECRET=$TURN_SECRET' > /opt/rpn-coord/env
-              chmod 600 /opt/rpn-coord/env
-            fi
+            # Open ports (idempotent)
+            ufw allow 8089/tcp comment 'rpn-coord WSS+REST' 2>/dev/null || true
+            ufw allow 3479/udp comment 'rpn-coord STUN'     2>/dev/null || true
+            ufw allow 3481/udp comment 'rpn-coord STUN2'    2>/dev/null || true
+            ufw allow 3480/udp comment 'rpn-coord TURN'     2>/dev/null || true
 
+            systemctl daemon-reload
+            systemctl enable rpn-coord
             systemctl restart rpn-coord
             sleep 2
             systemctl is-active rpn-coord

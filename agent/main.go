@@ -1,89 +1,32 @@
 package main
 
-// RPN Direct — Pi exit-node agent.
+// RPN Direct — Pi exit-node agent (fleet edition).
 //
-// Runs on the Raspberry Pi (ARMv7). Connects to the coordinator as role=exit,
-// reports its own ICE candidates (host + srflx) so the coordinator can include
-// them in the peers broadcast, and syncs the live client peer list into the
-// local kernel WireGuard interface (wgd0) via the `wg` CLI tool.
-//
-// When a new client peer is added with persistent-keepalive=5, kernel WireGuard
-// immediately initiates a handshake → keepalive packet → opens the CGNAT
-// mapping for that client's IP. The coordinator's /exit/info endpoint then
-// serves Pi's current CGNAT endpoint (read from wgd0 by the VPS coordinator),
-// and the Android client can connect WireGuard directly to the Pi.
+// Runs on every shipped Pi. On first boot the Pi is already registered (setup.sh
+// did that). This agent:
+//   1. Discovers its own STUN (public) endpoint.
+//   2. POSTs a heartbeat every 30s → coordinator tracks liveness + gets customer list.
+//   3. Syncs the live customer list into the local WireGuard interface.
+//   4. Customers connect DIRECTLY to this Pi — VPS carries zero data.
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
 	pionstun "github.com/pion/stun/v2"
 )
-
-// ── minimal wire types (mirrors coordinator/protocol.go) ─────────────────────
-
-const (
-	typeHello     = "hello"
-	typeWelcome   = "welcome"
-	typePeers     = "peers"
-	typeEndpoints = "endpoints"
-	typePing      = "ping"
-	typePong      = "pong"
-)
-
-type envelope struct {
-	Type string          `json:"type"`
-	Data json.RawMessage `json:"data,omitempty"`
-}
-
-type helloMsg struct {
-	AccessCode string `json:"accessCode"`
-	PubKey     string `json:"pubKey"`
-	Role       string `json:"role"`
-	Name       string `json:"name"`
-}
-
-type welcomeMsg struct {
-	SelfIP       string `json:"selfIP"`
-	STUNEndpoint string `json:"stunEndpoint"`
-}
-
-type candidate struct {
-	Type string `json:"type"`
-	Addr string `json:"addr"`
-}
-
-type endpointsMsg struct {
-	Candidates []candidate `json:"candidates"`
-}
-
-type peerInfo struct {
-	PubKey string `json:"pubKey"`
-	Role   string `json:"role"`
-	VPNIP  string `json:"vpnIP"`
-}
-
-type peersMsg struct {
-	Peers []peerInfo `json:"peers"`
-}
-
-func encode(t string, v any) ([]byte, error) {
-	raw, err := json.Marshal(v)
-	if err != nil {
-		return nil, err
-	}
-	return json.Marshal(envelope{Type: t, Data: raw})
-}
 
 // ── backoff ───────────────────────────────────────────────────────────────────
 
@@ -93,9 +36,7 @@ type backoff struct {
 	max     time.Duration
 }
 
-func newBackoff() *backoff {
-	return &backoff{base: 2 * time.Second, max: 60 * time.Second}
-}
+func newBackoff() *backoff { return &backoff{base: 2 * time.Second, max: 60 * time.Second} }
 
 func (b *backoff) next() time.Duration {
 	d := b.base
@@ -106,119 +47,69 @@ func (b *backoff) next() time.Duration {
 			break
 		}
 	}
-	// add up to 20% jitter
-	jitter := time.Duration(rand.Int63n(int64(d) / 5))
 	b.attempt++
-	return d + jitter
+	return d + time.Duration(rand.Int63n(int64(d)/5))
 }
 
 func (b *backoff) reset() { b.attempt = 0 }
 
-// ── STUN candidate discovery ──────────────────────────────────────────────────
+// ── STUN discovery ────────────────────────────────────────────────────────────
 
-// gatherCandidates collects the local host addresses and the srflx (server-
-// reflexive) address by sending a STUN binding request to the coordinator's
-// STUN endpoint. Returns all candidates; caller sends them as TypeEndpoints.
-func gatherCandidates(stunEndpoint string) []candidate {
-	var cands []candidate
-
-	// Host candidates: all non-loopback, non-link-local IPv4 addresses.
-	ifaces, _ := net.Interfaces()
-	for _, iface := range ifaces {
-		addrs, _ := iface.Addrs()
-		for _, addr := range addrs {
-			var ip net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
-			}
-			if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
-				continue
-			}
-			if ip4 := ip.To4(); ip4 != nil {
-				// Skip WireGuard tunnel and other VPN addresses.
-				if ip4[0] == 10 {
-					continue
-				}
-				cands = append(cands, candidate{Type: "host", Addr: fmt.Sprintf("%s:0", ip4.String())})
-			}
-		}
-	}
-
-	// Server-reflexive (srflx) candidate via STUN binding request.
-	if stunEndpoint != "" {
-		if srflx, ok := stunSRFLX(stunEndpoint); ok {
-			cands = append(cands, candidate{Type: "srflx", Addr: srflx})
-		}
-	}
-
-	return cands
-}
-
-// stunSRFLX sends a STUN binding request and returns the XOR-MAPPED-ADDRESS.
-func stunSRFLX(serverAddr string) (string, bool) {
+func stunSRFLX(serverAddr string) string {
 	conn, err := net.DialTimeout("udp", serverAddr, 5*time.Second)
 	if err != nil {
-		log.Printf("stun dial %s: %v", serverAddr, err)
-		return "", false
+		return ""
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
 
 	req, err := pionstun.Build(pionstun.TransactionID, pionstun.BindingRequest)
 	if err != nil {
-		return "", false
+		return ""
 	}
 	if _, err := conn.Write(req.Raw); err != nil {
-		return "", false
+		return ""
 	}
-
 	buf := make([]byte, 1500)
 	n, err := conn.Read(buf)
 	if err != nil {
-		log.Printf("stun read: %v", err)
-		return "", false
+		return ""
 	}
-
 	resp := &pionstun.Message{Raw: buf[:n]}
 	if err := resp.Decode(); err != nil {
-		return "", false
+		return ""
 	}
-	var xorAddr pionstun.XORMappedAddress
-	if err := xorAddr.GetFrom(resp); err != nil {
-		return "", false
+	var xor pionstun.XORMappedAddress
+	if err := xor.GetFrom(resp); err != nil {
+		return ""
 	}
-	srflx := fmt.Sprintf("%s:%d", xorAddr.IP.String(), xorAddr.Port)
-	log.Printf("srflx candidate: %s", srflx)
-	return srflx, true
+	return fmt.Sprintf("%s:%d", xor.IP.String(), xor.Port)
 }
 
 // ── wg helpers ────────────────────────────────────────────────────────────────
 
-func wgPubKey(iface string) (string, error) {
+func wgPubKey(iface string) string {
 	out, err := exec.Command("wg", "show", iface, "public-key").Output()
 	if err != nil {
-		return "", err
+		return ""
 	}
-	return strings.TrimSpace(string(out)), nil
+	return strings.TrimSpace(string(out))
 }
 
-// addPeer adds (or updates) a client peer on the local WireGuard interface.
-// persistent-keepalive=5 triggers an immediate handshake, opening the CGNAT
-// mapping so the client can reach Pi's wgd0 port directly.
-func addPeer(iface, pubKey, vpnIP string) {
-	args := []string{
-		"set", iface,
-		"peer", pubKey,
-		"allowed-ips", vpnIP,
-		"persistent-keepalive", "5",
+func wgPeerCount(iface string) int {
+	out, err := exec.Command("wg", "show", iface, "peers").Output()
+	if err != nil {
+		return 0
 	}
+	return len(strings.Fields(string(out)))
+}
+
+func addPeer(iface, pubKey, vpnIP string) {
+	args := []string{"set", iface, "peer", pubKey, "allowed-ips", vpnIP, "persistent-keepalive", "5"}
 	if out, err := exec.Command("wg", args...).CombinedOutput(); err != nil {
-		log.Printf("wg set peer %s: %v — %s", short(pubKey), err, out)
+		log.Printf("wg add peer %s: %v — %s", short(pubKey), err, out)
 	} else {
-		log.Printf("peer synced: %s vpn=%s", short(pubKey), vpnIP)
+		log.Printf("peer added: %s vpn=%s", short(pubKey), vpnIP)
 	}
 }
 
@@ -237,153 +128,162 @@ func short(s string) string {
 	return s
 }
 
-// ── status for healthz ────────────────────────────────────────────────────────
+// ── Pi identity ───────────────────────────────────────────────────────────────
 
-type status struct {
-	mu        sync.Mutex
-	connected bool
-	peerCount int
-	lastSeen  time.Time
-	selfIP    string
-}
-
-var st = &status{}
-
-func (s *status) setConnected(connected bool, selfIP string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.connected = connected
-	if selfIP != "" {
-		s.selfIP = selfIP
+// piSerial reads the Pi's CPU serial from /proc/cpuinfo (stable hardware ID).
+// Falls back to the MAC address of the first non-loopback interface.
+func piSerial() string {
+	data, err := os.ReadFile("/proc/cpuinfo")
+	if err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "Serial") {
+				parts := strings.SplitN(line, ":", 2)
+				if len(parts) == 2 {
+					s := strings.TrimSpace(parts[1])
+					if s != "" && s != "0000000000000000" {
+						return s
+					}
+				}
+			}
+		}
 	}
-	s.lastSeen = time.Now()
+	// Fallback: first non-loopback MAC
+	ifaces, _ := net.Interfaces()
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagLoopback != 0 || iface.HardwareAddr == nil {
+			continue
+		}
+		return strings.ReplaceAll(iface.HardwareAddr.String(), ":", "")
+	}
+	return "unknown"
 }
 
-func (s *status) setPeers(n int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.peerCount = n
-	s.lastSeen = time.Now()
+// ── coordinator REST client ───────────────────────────────────────────────────
+
+type coordClient struct {
+	base       string
+	httpClient *http.Client
 }
 
-func (s *status) json() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return fmt.Sprintf(`{"ok":%v,"peers":%d,"selfIP":%q,"lastSeen":%q}`,
-		s.connected, s.peerCount, s.selfIP, s.lastSeen.Format(time.RFC3339))
+func newCoordClient(base string) *coordClient {
+	return &coordClient{
+		base:       strings.TrimRight(base, "/"),
+		httpClient: &http.Client{Timeout: 10 * time.Second},
+	}
 }
+
+type heartbeatReq struct {
+	PiID      string `json:"pi_id"`
+	PubKey    string `json:"pubkey"`
+	StunEP    string `json:"stun_ep"`
+	Customers int    `json:"customers"`
+}
+
+type customerEntry struct {
+	PubKey string `json:"pubkey"`
+	VPNIP  string `json:"vpn_ip"`
+}
+
+func (c *coordClient) heartbeat(req heartbeatReq) ([]customerEntry, error) {
+	body, _ := json.Marshal(req)
+	resp, err := c.httpClient.Post(c.base+"/pi/heartbeat", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("heartbeat %d: %s", resp.StatusCode, b)
+	}
+	var out struct {
+		Customers []customerEntry `json:"customers"`
+	}
+	json.NewDecoder(resp.Body).Decode(&out)
+	return out.Customers, nil
+}
+
+// ── status ────────────────────────────────────────────────────────────────────
+
+type agentStatus struct {
+	mu        sync.Mutex
+	stunEP    string
+	customers int
+	lastBeat  time.Time
+	ok        bool
+}
+
+var status = &agentStatus{}
 
 // ── agent ─────────────────────────────────────────────────────────────────────
 
 type agent struct {
+	piID       string
 	iface      string
-	coord      string
-	accessCode string
-	name       string
-	known      map[string]bool // pubkeys of currently synced client peers
+	coord      *coordClient
+	stunServer string
+	known      map[string]bool
 }
 
 func (a *agent) run() {
 	a.known = map[string]bool{}
 	b := newBackoff()
+
 	for {
-		if err := a.connect(); err != nil {
+		err := a.tick()
+		if err != nil {
+			log.Printf("tick error: %v", err)
 			wait := b.next()
-			log.Printf("coordinator error: %v — retry in %s", err, wait.Round(time.Millisecond))
-			st.setConnected(false, "")
+			time.Sleep(wait)
 		} else {
 			b.reset()
+			time.Sleep(30 * time.Second)
 		}
-		time.Sleep(b.next())
 	}
 }
 
-func (a *agent) connect() error {
-	pubKey, err := wgPubKey(a.iface)
-	if err != nil {
-		return fmt.Errorf("wg pubkey: %w", err)
+func (a *agent) tick() error {
+	// Refresh STUN endpoint (it changes when CGNAT remaps)
+	stunEP := stunSRFLX(a.stunServer)
+	if stunEP != "" {
+		status.mu.Lock()
+		status.stunEP = stunEP
+		status.mu.Unlock()
 	}
-	log.Printf("local pubkey: %s", short(pubKey))
 
-	conn, _, err := websocket.DefaultDialer.Dial(a.coord+"/ws", nil)
-	if err != nil {
-		return fmt.Errorf("dial: %w", err)
-	}
-	defer conn.Close()
-	log.Printf("connected to coordinator %s", a.coord)
+	pubKey := wgPubKey(a.iface)
+	customers := wgPeerCount(a.iface)
 
-	hello, _ := encode(typeHello, helloMsg{
-		AccessCode: a.accessCode,
-		PubKey:     pubKey,
-		Role:       "exit",
-		Name:       a.name,
+	resp, err := a.coord.heartbeat(heartbeatReq{
+		PiID:      a.piID,
+		PubKey:    pubKey,
+		StunEP:    stunEP,
+		Customers: customers,
 	})
-	if err := conn.WriteMessage(websocket.TextMessage, hello); err != nil {
+	if err != nil {
 		return err
 	}
 
-	// Wait for welcome to get STUN endpoint, then gather and report candidates.
-	var stunEndpoint string
+	a.syncPeers(resp)
 
-	for {
-		_, raw, err := conn.ReadMessage()
-		if err != nil {
-			return err
-		}
-		var env envelope
-		if err := json.Unmarshal(raw, &env); err != nil {
-			continue
-		}
-		switch env.Type {
-		case typeWelcome:
-			var w welcomeMsg
-			if json.Unmarshal(env.Data, &w) == nil {
-				stunEndpoint = w.STUNEndpoint
-				log.Printf("registered: selfIP=%s stun=%s", w.SelfIP, stunEndpoint)
-				st.setConnected(true, w.SelfIP)
-			}
-			// Gather and report candidates now that we know the STUN server.
-			go func() {
-				cands := gatherCandidates(stunEndpoint)
-				if len(cands) == 0 {
-					return
-				}
-				msg, err := encode(typeEndpoints, endpointsMsg{Candidates: cands})
-				if err != nil {
-					return
-				}
-				if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
-					log.Printf("send endpoints: %v", err)
-				} else {
-					log.Printf("reported %d candidates (stun=%s)", len(cands), stunEndpoint)
-				}
-			}()
+	status.mu.Lock()
+	status.customers = len(resp)
+	status.lastBeat = time.Now()
+	status.ok = true
+	status.mu.Unlock()
 
-		case typePeers:
-			var pm peersMsg
-			if err := json.Unmarshal(env.Data, &pm); err != nil {
-				continue
-			}
-			a.syncPeers(pm.Peers)
-			st.setPeers(len(pm.Peers))
-
-		case typePing:
-			pong, _ := encode(typePong, nil)
-			conn.WriteMessage(websocket.TextMessage, pong)
-		}
-	}
+	return nil
 }
 
-func (a *agent) syncPeers(peers []peerInfo) {
+func (a *agent) syncPeers(list []customerEntry) {
 	seen := map[string]bool{}
-	for _, p := range peers {
-		if p.Role != "client" {
+	for _, c := range list {
+		if c.PubKey == "" {
 			continue
 		}
-		seen[p.PubKey] = true
-		if !a.known[p.PubKey] {
-			addPeer(a.iface, p.PubKey, p.VPNIP)
-			a.known[p.PubKey] = true
+		seen[c.PubKey] = true
+		if !a.known[c.PubKey] {
+			addPeer(a.iface, c.PubKey, c.VPNIP)
+			a.known[c.PubKey] = true
 		}
 	}
 	for pk := range a.known {
@@ -397,33 +297,43 @@ func (a *agent) syncPeers(peers []peerInfo) {
 // ── main ──────────────────────────────────────────────────────────────────────
 
 func main() {
-	coord      := flag.String("coordinator",  "ws://65.20.80.3:8089", "coordinator WSS URL")
-	iface      := flag.String("wg-iface",     "wgd0",                 "local WireGuard interface to manage")
-	code       := flag.String("access-code",  "",                      "coordinator access code (empty = dev mode)")
-	name       := flag.String("name",         "pi-india",              "human name for this exit node")
-	healthAddr := flag.String("healthz-addr", ":8090",                 "HTTP healthz listen address")
+	coord       := flag.String("coordinator",   "http://65.20.80.3:8089", "coordinator base URL")
+	iface       := flag.String("wg-iface",      "wgd0",                   "WireGuard interface to manage")
+	stunServer  := flag.String("stun",          "65.20.80.3:3479",        "STUN server for endpoint discovery")
+	healthAddr  := flag.String("healthz-addr",  ":8090",                  "healthz HTTP listen address")
+	piIDFlag    := flag.String("pi-id",         "",                       "Pi serial (auto-detected if empty)")
 	flag.Parse()
 
-	log.Printf("rpn-agent starting: iface=%s coordinator=%s", *iface, *coord)
+	piID := *piIDFlag
+	if piID == "" {
+		piID = piSerial()
+	}
+	if piID == "" || piID == "unknown" {
+		log.Fatalf("could not determine Pi serial — pass -pi-id manually")
+	}
+	log.Printf("rpn-agent: pi_id=%s iface=%s coordinator=%s", piID, *iface, *coord)
 
-	// Healthz endpoint for monitoring / systemd checks.
+	a := &agent{
+		piID:       piID,
+		iface:      *iface,
+		coord:      newCoordClient(*coord),
+		stunServer: *stunServer,
+	}
+
+	// Healthz
 	go func() {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+			status.mu.Lock()
+			s := fmt.Sprintf(`{"ok":%v,"stun_ep":%q,"customers":%d,"last_beat":%q}`,
+				status.ok, status.stunEP, status.customers, status.lastBeat.Format(time.RFC3339))
+			status.mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte(st.json()))
+			w.Write([]byte(s))
 		})
 		log.Printf("healthz on %s", *healthAddr)
-		if err := http.ListenAndServe(*healthAddr, mux); err != nil {
-			log.Printf("healthz: %v", err)
-		}
+		http.ListenAndServe(*healthAddr, mux)
 	}()
 
-	a := &agent{
-		iface:      *iface,
-		coord:      *coord,
-		accessCode: *code,
-		name:       *name,
-	}
 	a.run()
 }

@@ -1,26 +1,20 @@
 package main
 
-// RPN Direct coordinator — robust production version.
+// RPN Direct coordinator — infinitely scalable fleet edition.
 //
-// Control channel: WSS  :8089/tcp
-// STUN primary:         :3479/udp  (RFC 5389; public endpoint discovery)
-// STUN secondary:       :3481/udp  (RFC 5780; NAT-type classification via dual-port)
-// TURN relay:           :3480/udp  (WG-encrypted; last-resort when punch fails)
+// Architecture: VPS carries ZERO data. Each Pi is its own WireGuard hub.
+// Customers connect directly to their assigned Pi. The coordinator's only jobs:
+//   1. Pi fleet registry (register, heartbeat, liveness)
+//   2. Customer assignment (access-code → least-loaded Pi → WG config)
+//   3. Real-time signaling (WSS: punch, STUN candidates, relay fallback)
 //
-// Key design: coordinator introduces peers and triggers hole-punching; it is
-// NEVER in the data path once a direct WG connection is up. TURN relay is only
-// used when both ends are behind symmetric CGNAT with no other option.
+// Adding Pi #1001 adds capacity with zero VPS bandwidth cost.
 //
-// Added vs scaffold:
-//   - TLS (WSS) via -tls-cert/-tls-key
-//   - Persistent IP assignments (JSON state file, survives restarts)
-//   - HMAC-SHA1 time-limited TURN credentials (RFC 5766 §10.2 long-term)
-//   - Relay-first: send relay info immediately on connect so client has a
-//     working path right away; upgrade to direct when punch succeeds
-//   - Dual STUN ports for RFC 5780 NAT-behavior classification
-//   - Rate limiting: max 10 hello/min per remote IP
-//   - /exit/info: reads Pi's live CGNAT endpoint from wg show dump so the
-//     Android client can dial Pi directly with zero VPS data-path involvement
+// Ports:
+//   :8089/tcp  WSS control channel (punch + candidate exchange)
+//   :3479/udp  STUN primary  (RFC 5389)
+//   :3481/udp  STUN secondary (RFC 5780 dual-port NAT classification)
+//   :3480/udp  TURN relay    (last-resort only)
 
 import (
 	"crypto/hmac"
@@ -29,10 +23,10 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
-	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -45,25 +39,45 @@ import (
 	"github.com/pion/turn/v3"
 )
 
-var upgrader = websocket.Upgrader{
+var wsUpgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
-// ── persistent state ─────────────────────────────────────────────────────────
+// ── signaling hub (WSS) ───────────────────────────────────────────────────────
 
-type diskState struct {
-	IPs        map[string]string `json:"ips"`
-	NextClient int               `json:"nextClient"`
-	NextExit   int               `json:"nextExit"`
-}
-
-// ── peer ─────────────────────────────────────────────────────────────────────
-
-type peer struct {
+type wsPeer struct {
 	info    PeerInfo
 	network string
 	conn    *websocket.Conn
 	send    chan []byte
+}
+
+type sigHub struct {
+	mu    sync.Mutex
+	peers map[string]*wsPeer // pubKey -> wsPeer
+
+	stunAddr   string
+	stunAddr2  string
+	relayAddr  string
+	turnSecret string
+	rl         *rateLimiter
+	store      *store
+	fleetToken string
+	adminToken string
+}
+
+func newSigHub(db *store, stunAddr, stunAddr2, relayAddr, turnSecret, fleetToken, adminToken string) *sigHub {
+	return &sigHub{
+		peers:      map[string]*wsPeer{},
+		stunAddr:   stunAddr,
+		stunAddr2:  stunAddr2,
+		relayAddr:  relayAddr,
+		turnSecret: turnSecret,
+		rl:         newRateLimiter(),
+		store:      db,
+		fleetToken: fleetToken,
+		adminToken: adminToken,
+	}
 }
 
 // ── rate limiter ──────────────────────────────────────────────────────────────
@@ -97,157 +111,9 @@ func (r *rateLimiter) allow(key string, maxPerMin int) bool {
 	return true
 }
 
-// ── hub ──────────────────────────────────────────────────────────────────────
-
-type hub struct {
-	mu      sync.Mutex
-	peers   map[string]*peer  // pubKey -> peer
-	ips     map[string]string // pubKey -> stable VPN /32
-	codes   map[string]string // accessCode -> networkID ("" map = dev mode)
-	clientN int
-	exitN   int
-
-	stunAddr   string // primary STUN endpoint advertised to peers
-	stunAddr2  string // secondary STUN endpoint (RFC 5780 dual-port)
-	relayAddr  string // TURN relay endpoint advertised to peers
-	turnSecret string // HMAC-SHA1 secret for TURN credentials
-	stateFile  string // path to persist IP assignments
-
-	rl *rateLimiter
-}
-
-func newHub(codes map[string]string, stunAddr, stunAddr2, relayAddr, turnSecret, stateFile string) *hub {
-	h := &hub{
-		peers:      map[string]*peer{},
-		ips:        map[string]string{},
-		codes:      codes,
-		clientN:    101,
-		exitN:      2,
-		stunAddr:   stunAddr,
-		stunAddr2:  stunAddr2,
-		relayAddr:  relayAddr,
-		turnSecret: turnSecret,
-		stateFile:  stateFile,
-		rl:         newRateLimiter(),
-	}
-	h.loadState()
-	return h
-}
-
-func (h *hub) loadState() {
-	if h.stateFile == "" {
-		return
-	}
-	data, err := os.ReadFile(h.stateFile)
-	if err != nil {
-		return
-	}
-	var s diskState
-	if json.Unmarshal(data, &s) == nil && s.IPs != nil {
-		h.ips = s.IPs
-		if s.NextClient >= 101 {
-			h.clientN = s.NextClient
-		}
-		if s.NextExit >= 2 {
-			h.exitN = s.NextExit
-		}
-		log.Printf("state loaded: %d peers, nextClient=%d nextExit=%d", len(h.ips), h.clientN, h.exitN)
-	}
-}
-
-func (h *hub) saveState() {
-	if h.stateFile == "" {
-		return
-	}
-	s := diskState{IPs: h.ips, NextClient: h.clientN, NextExit: h.exitN}
-	data, err := json.MarshalIndent(s, "", "  ")
-	if err != nil {
-		return
-	}
-	tmp := h.stateFile + ".tmp"
-	if os.WriteFile(tmp, data, 0600) == nil {
-		os.Rename(tmp, h.stateFile)
-	}
-}
-
-func (h *hub) authNetwork(code string) (string, bool) {
-	if len(h.codes) == 0 {
-		return "default", true
-	}
-	n, ok := h.codes[code]
-	return n, ok
-}
-
-func (h *hub) assignIP(pubKey, role string) string {
-	if ip, ok := h.ips[pubKey]; ok {
-		return ip
-	}
-	var ip string
-	if role == RoleExit {
-		ip = "10.99.0." + itoa(h.exitN) + "/32"
-		h.exitN++
-	} else {
-		ip = "10.99.0." + itoa(h.clientN) + "/32"
-		h.clientN++
-	}
-	h.ips[pubKey] = ip
-	h.saveState()
-	return ip
-}
-
-func (h *hub) peerList(network, exclude string) []PeerInfo {
-	var out []PeerInfo
-	for pk, p := range h.peers {
-		if pk == exclude || p.network != network {
-			continue
-		}
-		out = append(out, p.info)
-	}
-	return out
-}
-
-func (h *hub) broadcastPeers(network string) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	for pk, p := range h.peers {
-		if p.network != network {
-			continue
-		}
-		msg, err := encode(TypePeers, Peers{Peers: h.peerList(network, pk)})
-		if err != nil {
-			continue
-		}
-		h.trySend(p, msg)
-	}
-}
-
-func (h *hub) trySend(p *peer, msg []byte) {
-	select {
-	case p.send <- msg:
-	default:
-		log.Printf("peer %s send buffer full — dropping", short(p.info.PubKey))
-		close(p.send)
-		delete(h.peers, p.info.PubKey)
-	}
-}
-
-func (h *hub) sendTo(pubKey string, msg []byte) bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	p, ok := h.peers[pubKey]
-	if !ok {
-		return false
-	}
-	h.trySend(p, msg)
-	return true
-}
-
 // ── TURN credentials ─────────────────────────────────────────────────────────
 
-// turnCreds generates time-limited HMAC-SHA1 TURN credentials.
-// username = "{expiry_unix}:{peer_short}", password = base64(HMAC-SHA1(secret, username)).
-// The TURN AuthHandler re-derives the password from the secret; no per-peer state needed.
-func (h *hub) turnCreds(peerKey string) (username, password string) {
+func (h *sigHub) turnCreds(peerKey string) (username, password string) {
 	expiry := time.Now().Add(24 * time.Hour).Unix()
 	username = fmt.Sprintf("%d:%s", expiry, short(peerKey))
 	mac := hmac.New(sha1.New, []byte(h.turnSecret))
@@ -256,7 +122,7 @@ func (h *hub) turnCreds(peerKey string) (username, password string) {
 	return
 }
 
-// ── WebSocket handler ─────────────────────────────────────────────────────────
+// ── WSS handler ───────────────────────────────────────────────────────────────
 
 func remoteIP(r *http.Request) string {
 	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
@@ -266,16 +132,15 @@ func remoteIP(r *http.Request) string {
 	return host
 }
 
-func (h *hub) handleWS(w http.ResponseWriter, r *http.Request) {
+func (h *sigHub) handleWS(w http.ResponseWriter, r *http.Request) {
 	clientIP := remoteIP(r)
 	if !h.rl.allow(clientIP, 10) {
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}
 
-	conn, err := upgrader.Upgrade(w, r, nil)
+	conn, err := wsUpgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("upgrade: %v", err)
 		return
 	}
 
@@ -291,30 +156,50 @@ func (h *hub) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var hello Hello
-	if err := json.Unmarshal(env.Data, &hello); err != nil {
+	if err := json.Unmarshal(env.Data, &hello); err != nil || hello.PubKey == "" {
 		conn.Close()
 		return
 	}
-	network, ok := h.authNetwork(hello.AccessCode)
-	if !ok || hello.PubKey == "" {
-		log.Printf("rejected hello from %s", clientIP)
-		conn.Close()
-		return
-	}
-	role := hello.Role
-	if role != RoleExit {
+
+	// Validate: access code or fleet token
+	var network, role string
+	if hello.Role == RoleExit && hello.AccessCode == h.fleetToken {
+		network = "fleet"
+		role = RoleExit
+	} else {
+		// Customer: look up access code in DB
+		net, _, ok := h.store.validateCode(hello.AccessCode)
+		if !ok {
+			log.Printf("ws: rejected %s from %s (bad code)", short(hello.PubKey), clientIP)
+			conn.Close()
+			return
+		}
+		network = net
 		role = RoleClient
 	}
 	conn.SetReadDeadline(time.Time{})
 
+	// Look up or create VPN IP from DB
+	var vpnIP string
+	if role == RoleExit {
+		p, _ := h.store.piByPubKey(hello.PubKey)
+		if p != nil {
+			vpnIP = p.VPNIP
+		} else {
+			vpnIP = "0.0.0.0/32" // Pi registers via REST; WSS just signals
+		}
+	} else {
+		c, _ := h.store.customerByID(hello.AccessCode)
+		if c != nil {
+			vpnIP = c.VPNIP
+		}
+	}
+
 	h.mu.Lock()
-	// Clean replacement for reconnecting peers: close old conn, new send channel.
 	if old, exists := h.peers[hello.PubKey]; exists {
 		old.conn.Close()
-		// writeLoop will exit when conn errors; don't close(old.send) here to avoid race.
 	}
-	vpnIP := h.assignIP(hello.PubKey, role)
-	p := &peer{
+	p := &wsPeer{
 		info: PeerInfo{
 			PubKey: hello.PubKey,
 			Role:   role,
@@ -327,7 +212,7 @@ func (h *hub) handleWS(w http.ResponseWriter, r *http.Request) {
 	h.peers[hello.PubKey] = p
 	h.mu.Unlock()
 
-	log.Printf("registered %s role=%s ip=%s network=%s from=%s", short(hello.PubKey), role, vpnIP, network, clientIP)
+	log.Printf("ws: registered %s role=%s net=%s", short(hello.PubKey), role, network)
 
 	welcome, _ := encode(TypeWelcome, Welcome{
 		SelfIP:        vpnIP,
@@ -343,7 +228,7 @@ func (h *hub) handleWS(w http.ResponseWriter, r *http.Request) {
 	h.readLoop(p)
 }
 
-func (h *hub) writeLoop(p *peer) {
+func (h *sigHub) writeLoop(p *wsPeer) {
 	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -367,7 +252,7 @@ func (h *hub) writeLoop(p *peer) {
 	}
 }
 
-func (h *hub) readLoop(p *peer) {
+func (h *sigHub) readLoop(p *wsPeer) {
 	defer h.drop(p)
 	p.conn.SetReadLimit(64 * 1024)
 	for {
@@ -405,7 +290,40 @@ func (h *hub) readLoop(p *peer) {
 	}
 }
 
-func (h *hub) introduce(p *peer, targetPubKey string) {
+func (h *sigHub) broadcastPeers(network string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var list []PeerInfo
+	for _, p := range h.peers {
+		if p.network == network {
+			list = append(list, p.info)
+		}
+	}
+	for _, p := range h.peers {
+		if p.network != network {
+			continue
+		}
+		filtered := make([]PeerInfo, 0, len(list))
+		for _, pi := range list {
+			if pi.PubKey != p.info.PubKey {
+				filtered = append(filtered, pi)
+			}
+		}
+		msg, _ := encode(TypePeers, Peers{Peers: filtered})
+		h.trySend(p, msg)
+	}
+}
+
+func (h *sigHub) trySend(p *wsPeer, msg []byte) {
+	select {
+	case p.send <- msg:
+	default:
+		close(p.send)
+		delete(h.peers, p.info.PubKey)
+	}
+}
+
+func (h *sigHub) introduce(p *wsPeer, targetPubKey string) {
 	h.mu.Lock()
 	target, ok := h.peers[targetPubKey]
 	if !ok || target.network != p.network {
@@ -415,53 +333,28 @@ func (h *hub) introduce(p *peer, targetPubKey string) {
 	at := time.Now().Add(500 * time.Millisecond).UnixMilli()
 	session := pairKey(p.info.PubKey, target.info.PubKey)
 
-	// RELAY FIRST — both peers get a working relay path immediately.
-	// They can use it right away while hole-punching runs in the background.
-	// This ensures the product always works on tap-one, even if NAT punch fails.
 	pUser, pPass := h.turnCreds(p.info.PubKey)
 	tUser, tPass := h.turnCreds(target.info.PubKey)
-	pRelayMsg, _ := encode(TypeRelay, Relay{
-		PeerPubKey: target.info.PubKey, RelaySession: session,
-		Username: pUser, Password: pPass,
-	})
-	tRelayMsg, _ := encode(TypeRelay, Relay{
-		PeerPubKey: p.info.PubKey, RelaySession: session,
-		Username: tUser, Password: tPass,
-	})
-	h.trySend(p, pRelayMsg)
-	h.trySend(target, tRelayMsg)
+	pRelay, _ := encode(TypeRelay, Relay{PeerPubKey: target.info.PubKey, RelaySession: session, Username: pUser, Password: pPass})
+	tRelay, _ := encode(TypeRelay, Relay{PeerPubKey: p.info.PubKey, RelaySession: session, Username: tUser, Password: tPass})
+	h.trySend(p, pRelay)
+	h.trySend(target, tRelay)
 
-	// THEN PUNCH — trigger synchronized simultaneous-open to upgrade to direct.
-	pToTarget, _ := encode(TypePunch, Punch{
-		PeerPubKey: target.info.PubKey,
-		Candidates: target.info.Candidates,
-		AtUnixMs:   at,
-	})
-	targetToP, _ := encode(TypePunch, Punch{
-		PeerPubKey: p.info.PubKey,
-		Candidates: p.info.Candidates,
-		AtUnixMs:   at,
-	})
-	h.trySend(p, pToTarget)
-	h.trySend(target, targetToP)
+	pPunch, _ := encode(TypePunch, Punch{PeerPubKey: target.info.PubKey, Candidates: target.info.Candidates, AtUnixMs: at})
+	tPunch, _ := encode(TypePunch, Punch{PeerPubKey: p.info.PubKey, Candidates: p.info.Candidates, AtUnixMs: at})
+	h.trySend(p, pPunch)
+	h.trySend(target, tPunch)
 	h.mu.Unlock()
-
-	log.Printf("introduce %s <-> %s at=%d relay=%s...", short(p.info.PubKey), short(targetPubKey), at, session[:8])
 }
 
-func (h *hub) onResult(p *peer, res Result) {
+func (h *sigHub) onResult(p *wsPeer, res Result) {
 	h.mu.Lock()
 	p.info.DirectOK = res.OK && res.Via == "direct"
 	h.mu.Unlock()
-	if res.OK {
-		log.Printf("path up %s->%s via=%s addr=%s", short(p.info.PubKey), short(res.PeerPubKey), res.Via, res.Addr)
-	} else {
-		// Relay path was already established in introduce(); just log.
-		log.Printf("direct failed %s<->%s (relay already active)", short(p.info.PubKey), short(res.PeerPubKey))
-	}
+	log.Printf("path %s->%s via=%s ok=%v", short(p.info.PubKey), short(res.PeerPubKey), res.Via, res.OK)
 }
 
-func (h *hub) drop(p *peer) {
+func (h *sigHub) drop(p *wsPeer) {
 	h.mu.Lock()
 	if cur, ok := h.peers[p.info.PubKey]; ok && cur == p {
 		delete(h.peers, p.info.PubKey)
@@ -470,23 +363,306 @@ func (h *hub) drop(p *peer) {
 	net := p.network
 	h.mu.Unlock()
 	p.conn.Close()
-	log.Printf("dropped %s", short(p.info.PubKey))
 	h.broadcastPeers(net)
 }
 
-// ── STUN server (RFC 5389) ────────────────────────────────────────────────────
-// Two instances run: primary (:3479) and secondary (:3481).
-// A client that compares its mapped address from both ports can detect whether
-// its NAT maps the same public ip:port regardless of destination (endpoint-
-// independent) or not (endpoint-dependent / symmetric). Symmetric NAT cannot
-// be punched; the relay is used instead.
+// ── REST API ──────────────────────────────────────────────────────────────────
+
+// POST /pi/register
+// Pi first-boot registration. Returns VPN IP + WG listen config.
+// Body: { fleet_token, serial, pubkey, name?, location? }
+func (h *sigHub) handlePiRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		FleetToken string `json:"fleet_token"`
+		Serial     string `json:"serial"`
+		PubKey     string `json:"pubkey"`
+		Name       string `json:"name"`
+		Location   string `json:"location"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil || req.FleetToken != h.fleetToken || req.Serial == "" || req.PubKey == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	existing, _ := h.store.piByID(req.Serial)
+	var vpnIP string
+	if existing != nil {
+		vpnIP = existing.VPNIP
+	} else {
+		ip, err := h.store.nextPiIP()
+		if err != nil {
+			http.Error(w, "no IPs available", http.StatusServiceUnavailable)
+			return
+		}
+		vpnIP = ip
+	}
+
+	if err := h.store.upsertPi(req.Serial, req.PubKey, vpnIP, req.Name, req.Location); err != nil {
+		log.Printf("upsertPi %s: %v", req.Serial, err)
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("pi registered: serial=%s pubkey=%s vpn=%s", req.Serial, short(req.PubKey), vpnIP)
+	jsonOK(w, map[string]any{
+		"pi_id":          req.Serial,
+		"vpn_ip":         vpnIP,
+		"wg_listen_port": 51821,
+		"coordinator":    "ws://" + r.Host + "/ws",
+	})
+}
+
+// POST /pi/heartbeat
+// Pi periodic health report (every 30s). Returns current customer list for peer sync.
+// Body: { pi_id, pubkey, stun_ep, customers }
+func (h *sigHub) handlePiHeartbeat(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		PiID      string `json:"pi_id"`
+		PubKey    string `json:"pubkey"`
+		StunEP    string `json:"stun_ep"`
+		Customers int    `json:"customers"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 2048)).Decode(&req); err != nil || req.PiID == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	if err := h.store.piHeartbeat(req.PiID, req.StunEP, req.Customers); err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+
+	// Return current customer list so Pi can sync its WG peers.
+	customers, _ := h.store.customersByPi(req.PiID)
+	type custOut struct {
+		PubKey string `json:"pubkey"`
+		VPNIP  string `json:"vpn_ip"`
+	}
+	out := make([]custOut, 0, len(customers))
+	for _, c := range customers {
+		if c.PubKey != "" {
+			out = append(out, custOut{PubKey: c.PubKey, VPNIP: c.VPNIP})
+		}
+	}
+	jsonOK(w, map[string]any{"customers": out})
+}
+
+// POST /customer/register
+// Customer app calls this with their access code + WG pubkey.
+// Returns WG config pointing directly at the assigned Pi (no VPS in data path).
+// Body: { access_code, pubkey }
+func (h *sigHub) handleCustomerRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		AccessCode string `json:"access_code"`
+		PubKey     string `json:"pubkey"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 2048)).Decode(&req); err != nil || req.AccessCode == "" || req.PubKey == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if !h.rl.allow("customer:"+req.AccessCode, 5) {
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return
+	}
+
+	_, usedBy, ok := h.store.validateCode(req.AccessCode)
+	if !ok {
+		http.Error(w, "invalid access code", http.StatusUnauthorized)
+		return
+	}
+
+	// Existing customer re-registering (new device / new key)
+	existing, _ := h.store.customerByID(req.AccessCode)
+	var vpnIP, piID string
+	var pi *PiRecord
+
+	if existing != nil {
+		vpnIP = existing.VPNIP
+		piID = existing.PiID
+		if piID != "" {
+			pi, _ = h.store.piByID(piID)
+		}
+	}
+
+	// Assign a Pi if not yet assigned or Pi went inactive
+	if pi == nil || pi.Active == 0 {
+		pi, _ = h.store.leastLoadedPi()
+		if pi == nil {
+			http.Error(w, "no Pi available — check back soon", http.StatusServiceUnavailable)
+			return
+		}
+		piID = pi.ID
+	}
+
+	if vpnIP == "" {
+		ip, err := h.store.nextCustomerIP()
+		if err != nil {
+			http.Error(w, "no IPs available", http.StatusServiceUnavailable)
+			return
+		}
+		vpnIP = ip
+	}
+	_ = usedBy
+
+	if err := h.store.upsertCustomer(req.AccessCode, req.PubKey, vpnIP, piID); err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	h.store.bindCode(req.AccessCode, req.AccessCode)
+
+	// Build WG config: customer dials Pi directly, VPS not in data path.
+	wgConf := fmt.Sprintf(`[Interface]
+PrivateKey = REPLACE_WITH_YOUR_PRIVATE_KEY
+Address = %s
+DNS = 1.1.1.1
+
+[Peer]
+PublicKey = %s
+Endpoint = %s
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+`, stripCIDR(vpnIP)+"/32", pi.PubKey, pi.StunEP)
+
+	log.Printf("customer registered: code=%s pubkey=%s vpn=%s pi=%s", req.AccessCode, short(req.PubKey), vpnIP, pi.ID)
+	jsonOK(w, map[string]any{
+		"vpn_ip":      vpnIP,
+		"pi_id":       pi.ID,
+		"pi_pubkey":   pi.PubKey,
+		"pi_endpoint": pi.StunEP,
+		"wg_config":   wgConf,
+	})
+}
+
+// ── admin API ─────────────────────────────────────────────────────────────────
+
+func (h *sigHub) adminAuth(r *http.Request) bool {
+	auth := r.Header.Get("Authorization")
+	return strings.TrimPrefix(auth, "Bearer ") == h.adminToken
+}
+
+// GET /admin/pis
+func (h *sigHub) handleAdminPis(w http.ResponseWriter, r *http.Request) {
+	if !h.adminAuth(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	pis, err := h.store.listPis()
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	jsonOK(w, map[string]any{"pis": pis, "count": len(pis)})
+}
+
+// POST /admin/codes  — create access codes
+// Body: { codes: ["ABC123", "DEF456"], network: "default" }
+func (h *sigHub) handleAdminCodes(w http.ResponseWriter, r *http.Request) {
+	if !h.adminAuth(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Codes   []string `json:"codes"`
+		Network string   `json:"network"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.Network == "" {
+		req.Network = "default"
+	}
+	for _, code := range req.Codes {
+		h.store.insertCode(code, req.Network)
+	}
+	jsonOK(w, map[string]any{"inserted": len(req.Codes)})
+}
+
+// GET /admin/customers?pi_id=xxx
+func (h *sigHub) handleAdminCustomers(w http.ResponseWriter, r *http.Request) {
+	if !h.adminAuth(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	piID := r.URL.Query().Get("pi_id")
+	var customers []CustomerRecord
+	var err error
+	if piID != "" {
+		customers, err = h.store.customersByPi(piID)
+	}
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	jsonOK(w, map[string]any{"customers": customers, "count": len(customers)})
+}
+
+// ── /exit/info (backward compat) ─────────────────────────────────────────────
+// Returns the Pi exit node's live endpoint from wg show dump.
+
+const piPubKey = "saTh5M1UOLIc7YzWhJqRYxtt5dzt/XebC37b/OgMh2U="
+
+type exitInfoResponse struct {
+	PubKey   string `json:"pubKey"`
+	Endpoint string `json:"endpoint"`
+}
+
+func wgDumpEndpoint(iface, pubKey string) (string, bool) {
+	out, err := exec.Command("wg", "show", iface, "dump").Output()
+	if err != nil {
+		return "", false
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Split(line, "\t")
+		if len(fields) < 3 {
+			continue
+		}
+		if strings.TrimSpace(fields[0]) == pubKey {
+			ep := strings.TrimSpace(fields[2])
+			if ep != "" && ep != "(none)" {
+				return ep, true
+			}
+		}
+	}
+	return "", false
+}
+
+func exitInfoHandler(wgIface string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ep, ok := wgDumpEndpoint(wgIface, piPubKey)
+		if !ok {
+			http.Error(w, `{"error":"pi endpoint not available"}`, http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(exitInfoResponse{PubKey: piPubKey, Endpoint: ep})
+	}
+}
+
+// ── STUN server ───────────────────────────────────────────────────────────────
 
 func runSTUN(addr string) {
 	pc, err := net.ListenPacket("udp4", addr)
 	if err != nil {
 		log.Fatalf("stun listen %s: %v", addr, err)
 	}
-	log.Printf("STUN (RFC 5389) listening on %s (udp)", addr)
+	log.Printf("STUN listening on %s (udp)", addr)
 	buf := make([]byte, 1500)
 	for {
 		n, src, err := pc.ReadFrom(buf)
@@ -522,32 +698,22 @@ func handleSTUN(pc net.PacketConn, src net.Addr, pkt []byte) {
 	pc.WriteTo(resp.Raw, src)
 }
 
-// ── TURN relay server (pion/turn) ─────────────────────────────────────────────
-// Used only when direct punch fails. The relay forwards opaque UDP; WG already
-// encrypts the payload so the relay sees nothing useful.
+// ── TURN relay ────────────────────────────────────────────────────────────────
 
 func runTURN(publicIP, listenAddr, secret string) {
-	udpAddr, err := net.ResolveUDPAddr("udp4", listenAddr)
-	if err != nil {
-		log.Fatalf("turn resolve %s: %v", listenAddr, err)
-	}
+	udpAddr, _ := net.ResolveUDPAddr("udp4", listenAddr)
 	conn, err := net.ListenPacket("udp4", udpAddr.String())
 	if err != nil {
 		log.Fatalf("turn listen %s: %v", listenAddr, err)
 	}
-
 	logFactory := pionlogging.NewDefaultLoggerFactory()
 	logFactory.DefaultLogLevel = pionlogging.LogLevelWarn
-
 	_, err = turn.NewServer(turn.ServerConfig{
 		Realm: "rpndirect",
 		AuthHandler: func(username, realm string, srcAddr net.Addr) ([]byte, bool) {
 			if secret == "" {
-				// Dev mode: open relay (warn logged at startup).
 				return turn.GenerateAuthKey(username, realm, username), true
 			}
-			// Verify time-limited HMAC-SHA1 credential.
-			// username format: "{expiry_unix}:{peer_short}"
 			parts := strings.SplitN(username, ":", 2)
 			if len(parts) != 2 {
 				return nil, false
@@ -558,18 +724,16 @@ func runTURN(publicIP, listenAddr, secret string) {
 			}
 			mac := hmac.New(sha1.New, []byte(secret))
 			mac.Write([]byte(username))
-			password := base64.StdEncoding.EncodeToString(mac.Sum(nil))
-			return turn.GenerateAuthKey(username, realm, password), true
+			pw := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+			return turn.GenerateAuthKey(username, realm, pw), true
 		},
-		PacketConnConfigs: []turn.PacketConnConfig{
-			{
-				PacketConn: conn,
-				RelayAddressGenerator: &turn.RelayAddressGeneratorStatic{
-					RelayAddress: net.ParseIP(publicIP),
-					Address:      "0.0.0.0",
-				},
+		PacketConnConfigs: []turn.PacketConnConfig{{
+			PacketConn: conn,
+			RelayAddressGenerator: &turn.RelayAddressGeneratorStatic{
+				RelayAddress: net.ParseIP(publicIP),
+				Address:      "0.0.0.0",
 			},
-		},
+		}},
 		LoggerFactory: logFactory,
 	})
 	if err != nil {
@@ -614,124 +778,94 @@ func pairKey(a, b string) string {
 	return b + "|" + a
 }
 
-func short(pubKey string) string {
-	if len(pubKey) > 8 {
-		return pubKey[:8]
+func short(s string) string {
+	if len(s) > 8 {
+		return s[:8]
 	}
-	return pubKey
+	return s
+}
+
+func stripCIDR(ip string) string {
+	if idx := strings.IndexByte(ip, '/'); idx >= 0 {
+		return ip[:idx]
+	}
+	return ip
+}
+
+func jsonOK(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(v)
 }
 
 func itoa(n int) string { return strconv.Itoa(n) }
 
-func parseCodes(s string) map[string]string {
-	out := map[string]string{}
-	for _, pair := range strings.Split(s, ",") {
-		pair = strings.TrimSpace(pair)
-		if pair == "" {
-			continue
-		}
-		kv := strings.SplitN(pair, ":", 2)
-		if len(kv) == 2 {
-			out[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
-		}
-	}
-	return out
-}
-
-// ── /exit/info ───────────────────────────────────────────────────────────────
-// Returns the Pi exit node's live public endpoint as seen by the VPS kernel
-// WireGuard (wg show wgd0 dump). The Android client fetches this to connect
-// WireGuard directly to the Pi — VPS is not in the data path at all.
-
-const piPubKey = "saTh5M1UOLIc7YzWhJqRYxtt5dzt/XebC37b/OgMh2U="
-
-type exitInfoResponse struct {
-	PubKey   string `json:"pubKey"`
-	Endpoint string `json:"endpoint"` // "122.164.83.185:11855" — Pi's live CGNAT endpoint
-}
-
-func wgDumpEndpoint(iface, pubKey string) (string, bool) {
-	out, err := exec.Command("wg", "show", iface, "dump").Output()
-	if err != nil {
-		return "", false
-	}
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Split(line, "\t")
-		if len(fields) < 3 {
-			continue
-		}
-		if strings.TrimSpace(fields[0]) == pubKey {
-			ep := strings.TrimSpace(fields[2])
-			if ep != "" && ep != "(none)" {
-				return ep, true
-			}
-		}
-	}
-	return "", false
-}
-
-func exitInfoHandler(wgIface string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		ep, ok := wgDumpEndpoint(wgIface, piPubKey)
-		if !ok {
-			http.Error(w, `{"error":"pi endpoint not available"}`, http.StatusServiceUnavailable)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(exitInfoResponse{PubKey: piPubKey, Endpoint: ep})
-	}
-}
-
 // ── main ──────────────────────────────────────────────────────────────────────
 
 func main() {
-	httpAddr   := flag.String("http",           ":8089",                "control-channel listen address")
-	tlsCert    := flag.String("tls-cert",       "",                     "TLS certificate file (enables WSS)")
-	tlsKey     := flag.String("tls-key",        "",                     "TLS private key file")
-	stunAddr   := flag.String("stun",           ":3479",                "primary STUN UDP listen address")
-	stun2Addr  := flag.String("stun2",          ":3481",                "secondary STUN UDP (RFC 5780 dual-port)")
-	turnAddr   := flag.String("turn",           ":3480",                "TURN relay UDP listen address")
-	publicIP   := flag.String("public-ip",      "65.20.80.3",           "VPS public IP (TURN relay generator)")
-	stunPub    := flag.String("stun-public",    "65.20.80.3:3479",      "advertised primary STUN endpoint")
-	stun2Pub   := flag.String("stun2-public",   "65.20.80.3:3481",      "advertised secondary STUN endpoint (RFC 5780)")
-	relayPub   := flag.String("relay-public",   "65.20.80.3:3480",      "advertised TURN relay endpoint")
-	turnSecret := flag.String("turn-secret",    "",                     "HMAC-SHA1 secret for TURN credentials (required in prod)")
-	codesStr   := flag.String("codes",          "",                     `access codes "code:network,..."; empty = dev mode`)
-	stateFile  := flag.String("state-file",     "/opt/rpn-coord/state.json", "persistent IP assignment state")
-	wgIface    := flag.String("wg-iface",       "wgd0",                 "WireGuard interface for /exit/info endpoint")
+	httpAddr    := flag.String("http",           ":8089",                "control-channel listen address")
+	tlsCert     := flag.String("tls-cert",       "",                     "TLS certificate file (enables WSS/HTTPS)")
+	tlsKey      := flag.String("tls-key",        "",                     "TLS private key file")
+	stunAddr    := flag.String("stun",           ":3479",                "primary STUN UDP listen address")
+	stun2Addr   := flag.String("stun2",          ":3481",                "secondary STUN UDP (RFC 5780 dual-port)")
+	turnAddr    := flag.String("turn",           ":3480",                "TURN relay UDP listen address")
+	publicIP    := flag.String("public-ip",      "65.20.80.3",           "VPS public IP")
+	stunPub     := flag.String("stun-public",    "65.20.80.3:3479",      "advertised primary STUN endpoint")
+	stun2Pub    := flag.String("stun2-public",   "65.20.80.3:3481",      "advertised secondary STUN endpoint")
+	relayPub    := flag.String("relay-public",   "65.20.80.3:3480",      "advertised TURN relay endpoint")
+	turnSecret  := flag.String("turn-secret",    "",                     "HMAC-SHA1 secret for TURN credentials")
+	fleetToken  := flag.String("fleet-token",    "",                     "shared secret baked into Pi SD card images")
+	adminToken  := flag.String("admin-token",    "",                     "admin API bearer token")
+	dbPath      := flag.String("db",             "/opt/rpn-coord/rpn.db","SQLite database path")
+	wgIface     := flag.String("wg-iface",       "wgd0",                 "WireGuard interface for /exit/info")
 	flag.Parse()
 
+	if *fleetToken == "" {
+		log.Printf("WARNING: -fleet-token not set — Pi registration disabled")
+	}
+	if *adminToken == "" {
+		log.Printf("WARNING: -admin-token not set — admin API open")
+	}
 	if *turnSecret == "" {
-		log.Printf("WARNING: -turn-secret not set — TURN relay is open (dev only, not for production)")
+		log.Printf("WARNING: -turn-secret not set — TURN relay is open (dev only)")
 	}
 
-	codes := parseCodes(*codesStr)
-	if len(codes) == 0 {
-		log.Printf("WARNING: DEV MODE — any access code accepted")
+	db, err := openStore(*dbPath)
+	if err != nil {
+		log.Fatalf("db: %v", err)
 	}
 
-	h := newHub(codes, *stunPub, *stun2Pub, *relayPub, *turnSecret, *stateFile)
+	h := newSigHub(db, *stunPub, *stun2Pub, *relayPub, *turnSecret, *fleetToken, *adminToken)
 
 	go runSTUN(*stunAddr)
 	go runSTUN(*stun2Addr)
 	go runTURN(*publicIP, *turnAddr, *turnSecret)
 
 	mux := http.NewServeMux()
+	// WSS signaling
 	mux.HandleFunc("/ws", h.handleWS)
+	// Pi fleet
+	mux.HandleFunc("/pi/register",  h.handlePiRegister)
+	mux.HandleFunc("/pi/heartbeat", h.handlePiHeartbeat)
+	// Customer
+	mux.HandleFunc("/customer/register", h.handleCustomerRegister)
+	// Admin
+	mux.HandleFunc("/admin/pis",       h.handleAdminPis)
+	mux.HandleFunc("/admin/customers", h.handleAdminCustomers)
+	mux.HandleFunc("/admin/codes",     h.handleAdminCodes)
+	// Backward compat
 	mux.HandleFunc("/exit/info", exitInfoHandler(*wgIface))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()
 		n := len(h.peers)
 		h.mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"ok":true,"peers":%d}`, n)
+		fmt.Fprintf(w, `{"ok":true,"ws_peers":%d}`, n)
 	})
 
 	if *tlsCert != "" && *tlsKey != "" {
-		log.Printf("coordinator (WSS/TLS) on %s", *httpAddr)
+		log.Printf("coordinator (HTTPS/WSS) on %s", *httpAddr)
 		log.Fatal(http.ListenAndServeTLS(*httpAddr, *tlsCert, *tlsKey, mux))
 	} else {
-		log.Printf("coordinator (WS, no TLS) on %s — set -tls-cert/-tls-key for production", *httpAddr)
+		log.Printf("coordinator (HTTP/WS, no TLS) on %s", *httpAddr)
 		log.Fatal(http.ListenAndServe(*httpAddr, mux))
 	}
 }

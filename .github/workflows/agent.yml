@@ -43,7 +43,20 @@ jobs:
           path: agent/rpn-agent
           if-no-files-found: error
 
-      - name: Deploy to Pi via VPS
+      # Publish as a GitHub release asset so setup.sh can curl it directly.
+      - name: Publish release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Delete old 'latest' release if it exists, then recreate.
+          gh release delete latest --repo dataaivu/rpn-direct --yes 2>/dev/null || true
+          gh release create latest ../agent/rpn-agent \
+            --repo dataaivu/rpn-direct \
+            --title "latest" \
+            --notes "Auto-published agent binary" \
+            --asset rpn-agent-linux-arm7=rpn-agent
+
+      - name: Deploy to live Pi via VPS
         env:
           VPS_KEY: ${{ secrets.VPS_SSH_KEY }}
         run: |
@@ -52,12 +65,8 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H 65.20.80.3 >> ~/.ssh/known_hosts
 
-          # Copy binary to VPS, then forward to Pi over the WireGuard tunnel
           scp -i ~/.ssh/id_ed25519 rpn-agent root@65.20.80.3:/tmp/rpn-agent
-
-          # Trust the Pi host key via VPS (Pi is not directly reachable from internet)
           ssh -i ~/.ssh/id_ed25519 root@65.20.80.3 'ssh-keyscan -H 10.99.0.2 >> ~/.ssh/known_hosts 2>/dev/null; echo ok'
-
           ssh -i ~/.ssh/id_ed25519 root@65.20.80.3 '
             scp -i /root/.ssh/id_ed25519_pi /tmp/rpn-agent root@10.99.0.2:/opt/rpn-agent/rpn-agent.new
             ssh -i /root/.ssh/id_ed25519_pi root@10.99.0.2 "

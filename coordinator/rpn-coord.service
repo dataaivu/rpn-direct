@@ -1,5 +1,5 @@
 [Unit]
-Description=RPN Direct coordinator (WSS + STUN + TURN)
+Description=RPN Direct coordinator (fleet edition — WSS + STUN + TURN + REST)
 After=network.target wg-quick@wgd0.service
 
 [Service]
@@ -7,23 +7,27 @@ Type=simple
 User=root
 WorkingDirectory=/opt/rpn-coord
 
-# TURN_SECRET must be set here — never commit it.
-# Populate /opt/rpn-coord/env with: TURN_SECRET=<random-secret>
-# The CI deploy step writes this from the RPN_TURN_SECRET GitHub secret.
+# Secrets — CI writes these from GitHub secrets (never commit actual values).
+# /opt/rpn-coord/env format:
+#   FLEET_TOKEN=<random — baked into Pi SD card images>
+#   ADMIN_TOKEN=<random — for admin API>
+#   TURN_SECRET=<random — for TURN credentials>
 EnvironmentFile=/opt/rpn-coord/env
 
 ExecStart=/opt/rpn-coord/rpn-coord \
-    -http       :8089 \
-    -stun       :3479 \
-    -stun2      :3481 \
-    -turn       :3480 \
-    -public-ip  65.20.80.3 \
-    -stun-public  65.20.80.3:3479 \
-    -stun2-public 65.20.80.3:3481 \
-    -relay-public 65.20.80.3:3480 \
-    -turn-secret  ${TURN_SECRET} \
-    -state-file /opt/rpn-coord/state.json \
-    -wg-iface   wgd0
+    -http          :8089 \
+    -stun          :3479 \
+    -stun2         :3481 \
+    -turn          :3480 \
+    -public-ip     65.20.80.3 \
+    -stun-public   65.20.80.3:3479 \
+    -stun2-public  65.20.80.3:3481 \
+    -relay-public  65.20.80.3:3480 \
+    -turn-secret   ${TURN_SECRET} \
+    -fleet-token   ${FLEET_TOKEN} \
+    -admin-token   ${ADMIN_TOKEN} \
+    -db            /opt/rpn-coord/rpn.db \
+    -wg-iface      wgd0
 
 Restart=always
 RestartSec=5
