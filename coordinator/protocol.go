@@ -70,6 +70,8 @@ type PeerInfo struct {
 	VPNIP      string      `json:"vpnIP"`
 	Candidates []Candidate `json:"candidates"`
 	DirectOK   bool        `json:"directOK"` // last known: a direct path exists
+	Ufrag      string      `json:"ufrag"`    // ICE short-term credential
+	Pwd        string      `json:"pwd"`      // ICE short-term credential
 }
 
 type Peers struct {
@@ -78,6 +80,8 @@ type Peers struct {
 
 type Endpoints struct {
 	Candidates []Candidate `json:"candidates"`
+	Ufrag      string      `json:"ufrag"`
+	Pwd        string      `json:"pwd"`
 }
 
 type Connect struct {
@@ -88,6 +92,8 @@ type Punch struct {
 	PeerPubKey string      `json:"peerPubKey"`
 	Candidates []Candidate `json:"candidates"`
 	AtUnixMs   int64       `json:"atUnixMs"` // synchronized start instant for simultaneous-open
+	Ufrag      string      `json:"ufrag"`    // the peer's ICE short-term credential
+	Pwd        string      `json:"pwd"`      // the peer's ICE short-term credential
 }
 
 type Result struct {

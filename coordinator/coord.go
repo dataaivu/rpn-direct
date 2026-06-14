@@ -271,6 +271,8 @@ func (h *sigHub) readLoop(p *wsPeer) {
 				h.mu.Lock()
 				p.info.Candidates = e.Candidates
 				p.info.DirectOK = hasPublicCandidate(e.Candidates)
+				p.info.Ufrag = e.Ufrag
+				p.info.Pwd = e.Pwd
 				net := p.network
 				h.mu.Unlock()
 				h.broadcastPeers(net)
@@ -340,8 +342,8 @@ func (h *sigHub) introduce(p *wsPeer, targetPubKey string) {
 	h.trySend(p, pRelay)
 	h.trySend(target, tRelay)
 
-	pPunch, _ := encode(TypePunch, Punch{PeerPubKey: target.info.PubKey, Candidates: target.info.Candidates, AtUnixMs: at})
-	tPunch, _ := encode(TypePunch, Punch{PeerPubKey: p.info.PubKey, Candidates: p.info.Candidates, AtUnixMs: at})
+	pPunch, _ := encode(TypePunch, Punch{PeerPubKey: target.info.PubKey, Candidates: target.info.Candidates, AtUnixMs: at, Ufrag: target.info.Ufrag, Pwd: target.info.Pwd})
+	tPunch, _ := encode(TypePunch, Punch{PeerPubKey: p.info.PubKey, Candidates: p.info.Candidates, AtUnixMs: at, Ufrag: p.info.Ufrag, Pwd: p.info.Pwd})
 	h.trySend(p, pPunch)
 	h.trySend(target, tPunch)
 	h.mu.Unlock()
@@ -443,13 +445,14 @@ func (h *sigHub) handlePiHeartbeat(w http.ResponseWriter, r *http.Request) {
 	// Return current customer list so Pi can sync its WG peers.
 	customers, _ := h.store.customersByPi(req.PiID)
 	type custOut struct {
-		PubKey string `json:"pubkey"`
-		VPNIP  string `json:"vpn_ip"`
+		PubKey   string `json:"pubkey"`
+		VPNIP    string `json:"vpn_ip"`
+		Endpoint string `json:"endpoint"` // so the Pi can set the peer endpoint and punch back
 	}
 	out := make([]custOut, 0, len(customers))
 	for _, c := range customers {
 		if c.PubKey != "" {
-			out = append(out, custOut{PubKey: c.PubKey, VPNIP: c.VPNIP})
+			out = append(out, custOut{PubKey: c.PubKey, VPNIP: c.VPNIP, Endpoint: c.Endpoint})
 		}
 	}
 	jsonOK(w, map[string]any{"customers": out})
@@ -467,6 +470,7 @@ func (h *sigHub) handleCustomerRegister(w http.ResponseWriter, r *http.Request) 
 	var req struct {
 		AccessCode string `json:"access_code"`
 		PubKey     string `json:"pubkey"`
+		Endpoint   string `json:"endpoint"` // customer's STUN-mapped ip:port, for the Pi to punch back
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 2048)).Decode(&req); err != nil || req.AccessCode == "" || req.PubKey == "" {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -516,7 +520,7 @@ func (h *sigHub) handleCustomerRegister(w http.ResponseWriter, r *http.Request) 
 	}
 	_ = usedBy
 
-	if err := h.store.upsertCustomer(req.AccessCode, req.PubKey, vpnIP, piID); err != nil {
+	if err := h.store.upsertCustomer(req.AccessCode, req.PubKey, vpnIP, piID, req.Endpoint); err != nil {
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return
 	}

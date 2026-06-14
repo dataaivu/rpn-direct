@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -28,6 +29,7 @@ CREATE TABLE IF NOT EXISTS customers (
     pubkey    TEXT,                        -- WireGuard public key (set on first connect)
     vpn_ip    TEXT UNIQUE NOT NULL,        -- assigned VPN /32 (10.100.y.y)
     pi_id     TEXT REFERENCES pis(id),    -- assigned Pi
+    endpoint  TEXT    DEFAULT '',          -- customer's STUN-mapped ip:port (for the Pi to punch back)
     last_seen INTEGER DEFAULT 0,
     active    INTEGER DEFAULT 1
 );
@@ -63,6 +65,7 @@ type CustomerRecord struct {
 	PubKey   string
 	VPNIP    string
 	PiID     string
+	Endpoint string
 	LastSeen int64
 	Active   int
 }
@@ -80,6 +83,12 @@ func openStore(path string) (*store, error) {
 	}
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("schema: %w", err)
+	}
+	// Migration for DBs created before the endpoint column existed. Ignore the
+	// "duplicate column" error when it's already present.
+	if _, err := db.Exec(`ALTER TABLE customers ADD COLUMN endpoint TEXT DEFAULT ''`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column") {
+		log.Printf("migrate endpoint column: %v", err)
 	}
 	log.Printf("db open: %s", path)
 	return &store{db}, nil
@@ -172,26 +181,29 @@ func (s *store) listPis() ([]PiRecord, error) {
 func (s *store) customerByID(id string) (*CustomerRecord, error) {
 	var c CustomerRecord
 	err := s.db.QueryRow(
-		`SELECT id, COALESCE(pubkey,''), vpn_ip, COALESCE(pi_id,''), last_seen, active FROM customers WHERE id = ?`, id,
-	).Scan(&c.ID, &c.PubKey, &c.VPNIP, &c.PiID, &c.LastSeen, &c.Active)
+		`SELECT id, COALESCE(pubkey,''), vpn_ip, COALESCE(pi_id,''), COALESCE(endpoint,''), last_seen, active FROM customers WHERE id = ?`, id,
+	).Scan(&c.ID, &c.PubKey, &c.VPNIP, &c.PiID, &c.Endpoint, &c.LastSeen, &c.Active)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	return &c, err
 }
 
-func (s *store) upsertCustomer(id, pubKey, vpnIP, piID string) error {
+func (s *store) upsertCustomer(id, pubKey, vpnIP, piID, endpoint string) error {
 	_, err := s.db.Exec(`
-		INSERT INTO customers(id, pubkey, vpn_ip, pi_id)
-		VALUES(?,?,?,?)
-		ON CONFLICT(id) DO UPDATE SET pubkey=excluded.pubkey, pi_id=excluded.pi_id
-	`, id, pubKey, vpnIP, piID)
+		INSERT INTO customers(id, pubkey, vpn_ip, pi_id, endpoint)
+		VALUES(?,?,?,?,?)
+		ON CONFLICT(id) DO UPDATE SET
+			pubkey   = excluded.pubkey,
+			pi_id    = excluded.pi_id,
+			endpoint = COALESCE(NULLIF(excluded.endpoint,''), customers.endpoint)
+	`, id, pubKey, vpnIP, piID, endpoint)
 	return err
 }
 
 func (s *store) customersByPi(piID string) ([]CustomerRecord, error) {
 	rows, err := s.db.Query(
-		`SELECT id, COALESCE(pubkey,''), vpn_ip, COALESCE(pi_id,''), last_seen, active FROM customers WHERE pi_id = ? AND active = 1`, piID,
+		`SELECT id, COALESCE(pubkey,''), vpn_ip, COALESCE(pi_id,''), COALESCE(endpoint,''), last_seen, active FROM customers WHERE pi_id = ? AND active = 1`, piID,
 	)
 	if err != nil {
 		return nil, err
@@ -200,7 +212,7 @@ func (s *store) customersByPi(piID string) ([]CustomerRecord, error) {
 	var out []CustomerRecord
 	for rows.Next() {
 		var c CustomerRecord
-		if err := rows.Scan(&c.ID, &c.PubKey, &c.VPNIP, &c.PiID, &c.LastSeen, &c.Active); err != nil {
+		if err := rows.Scan(&c.ID, &c.PubKey, &c.VPNIP, &c.PiID, &c.Endpoint, &c.LastSeen, &c.Active); err != nil {
 			continue
 		}
 		out = append(out, c)

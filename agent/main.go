@@ -104,12 +104,31 @@ func wgPeerCount(iface string) int {
 	return len(strings.Fields(string(out)))
 }
 
-func addPeer(iface, pubKey, vpnIP string) {
+func addPeer(iface, pubKey, vpnIP, endpoint string) {
 	args := []string{"set", iface, "peer", pubKey, "allowed-ips", vpnIP, "persistent-keepalive", "5"}
+	// Setting the endpoint makes the Pi send toward the customer's mapped address,
+	// opening its port-restricted CGNAT filter so the customer's packets get in.
+	// WireGuard's roaming will correct the endpoint once the handshake lands.
+	if endpoint != "" {
+		args = append(args, "endpoint", endpoint)
+	}
 	if out, err := exec.Command("wg", args...).CombinedOutput(); err != nil {
 		log.Printf("wg add peer %s: %v — %s", short(pubKey), err, out)
 	} else {
-		log.Printf("peer added: %s vpn=%s", short(pubKey), vpnIP)
+		log.Printf("peer added: %s vpn=%s ep=%s", short(pubKey), vpnIP, endpoint)
+	}
+}
+
+// setPeerEndpoint re-points an existing peer at a new mapped endpoint (the
+// customer roamed or its CGNAT remapped).
+func setPeerEndpoint(iface, pubKey, endpoint string) {
+	if endpoint == "" {
+		return
+	}
+	if out, err := exec.Command("wg", "set", iface, "peer", pubKey, "endpoint", endpoint).CombinedOutput(); err != nil {
+		log.Printf("wg set endpoint %s: %v — %s", short(pubKey), err, out)
+	} else {
+		log.Printf("peer endpoint updated: %s ep=%s", short(pubKey), endpoint)
 	}
 }
 
@@ -180,8 +199,9 @@ type heartbeatReq struct {
 }
 
 type customerEntry struct {
-	PubKey string `json:"pubkey"`
-	VPNIP  string `json:"vpn_ip"`
+	PubKey   string `json:"pubkey"`
+	VPNIP    string `json:"vpn_ip"`
+	Endpoint string `json:"endpoint"` // customer's STUN-mapped ip:port (bootstraps the punch)
 }
 
 func (c *coordClient) heartbeat(req heartbeatReq) ([]customerEntry, error) {
@@ -221,11 +241,11 @@ type agent struct {
 	iface      string
 	coord      *coordClient
 	stunServer string
-	known      map[string]bool
+	known      map[string]string // customer pubkey -> last endpoint applied
 }
 
 func (a *agent) run() {
-	a.known = map[string]bool{}
+	a.known = map[string]string{}
 	b := newBackoff()
 
 	for {
@@ -281,9 +301,13 @@ func (a *agent) syncPeers(list []customerEntry) {
 			continue
 		}
 		seen[c.PubKey] = true
-		if !a.known[c.PubKey] {
-			addPeer(a.iface, c.PubKey, c.VPNIP)
-			a.known[c.PubKey] = true
+		if _, ok := a.known[c.PubKey]; !ok {
+			addPeer(a.iface, c.PubKey, c.VPNIP, c.Endpoint)
+			a.known[c.PubKey] = c.Endpoint
+		} else if c.Endpoint != "" && c.Endpoint != a.known[c.PubKey] {
+			// Customer's mapped endpoint changed — re-point so the punch keeps working.
+			setPeerEndpoint(a.iface, c.PubKey, c.Endpoint)
+			a.known[c.PubKey] = c.Endpoint
 		}
 	}
 	for pk := range a.known {
