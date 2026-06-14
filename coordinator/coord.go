@@ -19,6 +19,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -470,6 +471,54 @@ func parseCodes(s string) map[string]string {
 	return out
 }
 
+// ── /exit/info ───────────────────────────────────────────────────────────────
+//
+// Returns the Pi exit node's live public endpoint as seen by the VPS kernel
+// WireGuard (wg show wgd0 dump). The Android client uses this to connect
+// WireGuard directly to the Pi instead of relaying through the VPS hub.
+
+const piPubKey = "saTh5M1UOLIc7YzWhJqRYxtt5dzt/XebC37b/OgMh2U="
+
+type exitInfoResponse struct {
+	PubKey   string `json:"pubKey"`
+	Endpoint string `json:"endpoint"` // "122.164.83.185:11855" — Pi's CGNAT endpoint
+}
+
+// wgDumpEndpoint shells out to 'wg show <iface> dump' and finds the endpoint
+// for the peer matching pubKey. dump columns (tab-separated):
+//   pubkey  preshared  endpoint  allowed-ips  last-handshake  rx  tx  keepalive
+func wgDumpEndpoint(iface, pubKey string) (string, bool) {
+	out, err := exec.Command("wg", "show", iface, "dump").Output()
+	if err != nil {
+		return "", false
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Split(line, "\t")
+		if len(fields) < 3 {
+			continue
+		}
+		if strings.TrimSpace(fields[0]) == pubKey {
+			ep := strings.TrimSpace(fields[2])
+			if ep != "" && ep != "(none)" {
+				return ep, true
+			}
+		}
+	}
+	return "", false
+}
+
+func exitInfoHandler(wgIface string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ep, ok := wgDumpEndpoint(wgIface, piPubKey)
+		if !ok {
+			http.Error(w, `{"error":"pi endpoint not available"}`, http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(exitInfoResponse{PubKey: piPubKey, Endpoint: ep})
+	}
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 func main() {
@@ -480,6 +529,7 @@ func main() {
 	stunPub   := flag.String("stun-public",  "65.20.80.3:3479", "Advertised STUN endpoint")
 	relayPub  := flag.String("relay-public", "65.20.80.3:3480", "Advertised TURN relay endpoint")
 	codesStr  := flag.String("codes",        "",            `Access codes "code:network,..."; empty = dev mode`)
+	wgIface   := flag.String("wg-iface",    "wgd0",        "WireGuard interface to query for exit node endpoint")
 	flag.Parse()
 
 	codes := parseCodes(*codesStr)
@@ -494,6 +544,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", h.handleWS)
+	mux.HandleFunc("/exit/info", exitInfoHandler(*wgIface))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()
 		n := len(h.peers)

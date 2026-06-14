@@ -1,0 +1,70 @@
+name: Build & Deploy Agent
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - 'agent/**'
+      - '.github/workflows/agent.yml'
+  workflow_dispatch:
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Resolve modules
+        run: go mod tidy
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build linux/arm binary (Pi ARMv7)
+        env:
+          GOOS: linux
+          GOARCH: arm
+          GOARM: 7
+          CGO_ENABLED: 0
+        run: go build -ldflags="-s -w" -o rpn-agent ./...
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpn-agent-linux-arm7
+          path: agent/rpn-agent
+          if-no-files-found: error
+
+      - name: Deploy to Pi via VPS
+        env:
+          VPS_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$VPS_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H 65.20.80.3 >> ~/.ssh/known_hosts
+
+          # Copy binary to VPS, then forward to Pi over the WireGuard tunnel
+          scp -i ~/.ssh/id_ed25519 rpn-agent root@65.20.80.3:/tmp/rpn-agent
+
+          # Trust the Pi host key via VPS (Pi not directly reachable from internet)
+          ssh -i ~/.ssh/id_ed25519 root@65.20.80.3 'ssh-keyscan -H 10.99.0.2 >> ~/.ssh/known_hosts 2>/dev/null; echo ok'
+
+          ssh -i ~/.ssh/id_ed25519 root@65.20.80.3 '
+            scp -i /root/.ssh/id_ed25519_pi /tmp/rpn-agent root@10.99.0.2:/opt/rpn-agent/rpn-agent.new
+            ssh -i /root/.ssh/id_ed25519_pi root@10.99.0.2 "
+              mv /opt/rpn-agent/rpn-agent.new /opt/rpn-agent/rpn-agent
+              chmod +x /opt/rpn-agent/rpn-agent
+              systemctl restart rpn-agent
+              sleep 2
+              systemctl is-active rpn-agent
+            "
+          '
