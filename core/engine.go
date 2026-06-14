@@ -364,6 +364,17 @@ func keyB64ToHex(b64 string) (string, error) {
 	return hex.EncodeToString(raw), nil
 }
 
+// PublicKey derives the base64 WireGuard public key from a base64 private key.
+// Exposed for the mobile wrapper so Android needs no WireGuard crypto library.
+// Returns "" on error.
+func PublicKey(privB64 string) string {
+	pub, err := pubFromPriv(privB64)
+	if err != nil {
+		return ""
+	}
+	return pub
+}
+
 // pubFromPriv derives a Curve25519 public key (base64) from a base64 private key.
 func pubFromPriv(privB64 string) (string, error) {
 	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(privB64))

@@ -15,3 +15,7 @@ func Stop() { core.Stop() }
 
 // Status returns a short state string for the UI.
 func Status() string { return core.Status() }
+
+// PublicKey derives the base64 WireGuard public key from a base64 private key,
+// so the app needs no WireGuard crypto library.
+func PublicKey(privKeyB64 string) string { return core.PublicKey(privKeyB64) }

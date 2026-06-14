@@ -32,7 +32,8 @@ android {
 }
 
 dependencies {
-    // Permissive WireGuard userspace engine (Apache-2.0 lib wrapping MIT wireguard-go).
-    // This is the only third-party piece; everything else here is from scratch.
-    implementation("com.wireguard.android:tunnel:1.0.20230706")
+    // Our own shared ICE + userspace-WireGuard engine, built from core/ via
+    // `gomobile bind` into app/libs/rpncore.aar by the CI workflow. Embeds
+    // wireguard-go + pion/ice. No third-party Android WireGuard library.
+    implementation(files("libs/rpncore.aar"))
 }

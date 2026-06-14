@@ -3,107 +3,112 @@ package com.rpndirect.app
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.app.Service
-import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.VpnService
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
-import com.wireguard.android.backend.Backend
-import com.wireguard.android.backend.GoBackend
-import com.wireguard.android.backend.Tunnel
-import com.wireguard.config.Config
-import com.wireguard.crypto.KeyPair
-import java.io.BufferedReader
-import java.io.StringReader
-import java.net.DatagramSocket
-import java.net.InetSocketAddress
+import mobile.Mobile
+import org.json.JSONObject
 import kotlin.concurrent.thread
 
 /**
- * Foreground service that owns the WireGuard backend and the whole connect
- * lifecycle. Living in a foreground service (not the Activity) is what fixes the
- * lifecycle failures the test suite caught:
- *   - foreground notification keeps the process alive across screen-off / doze (T6)
- *   - a PARTIAL_WAKE_LOCK stops the CPU freezing the wireguard-go goroutines
- *   - backend ownership outlives the Activity, so reconnect works after the UI is
- *     destroyed or force-stopped (T8/T9)
+ * The VpnService + foreground service that owns the tunnel. Flow on connect:
+ *   1. load/derive WG keys (pubkey via the engine, no crypto lib)
+ *   2. REST-register for a VPN /32
+ *   3. establish() the tun — and exclude THIS app from the tunnel so the engine's
+ *      own ICE/WireGuard UDP sockets ride the real network (no routing loop)
+ *   4. hand the tun fd to the Go ICE engine (Mobile.start)
  *
- * Connect flow: STUN (from the fixed WG port) -> register with coordinator ->
- * build a config that dials the assigned Pi directly -> setState(UP).
+ * Foreground + wakelock keep the process alive across screen-off/doze; the engine
+ * lives in the service so it survives Activity teardown.
  */
-class RpnService : Service() {
+class RpnService : VpnService() {
 
     inner class LocalBinder : Binder() {
         val service get() = this@RpnService
     }
     private val binder = LocalBinder()
 
-    private lateinit var backend: Backend
+    private var tunFd: Int = -1
     private lateinit var wakeLock: PowerManager.WakeLock
-    private val tunnel = RpnTunnel()
 
     @Volatile var lastError: String? = null; private set
     @Volatile var connecting = false; private set
+    @Volatile var connected = false; private set
 
-    /** UI observer; set by the bound Activity. */
-    var onState: ((Tunnel.State) -> Unit)? = null
-
-    private inner class RpnTunnel : Tunnel {
-        override fun getName() = AppConfig.TUNNEL_NAME
-        override fun onStateChange(newState: Tunnel.State) {
-            onState?.invoke(newState)
-            if (newState == Tunnel.State.DOWN) releaseAndStop()
-        }
-    }
+    var onState: (() -> Unit)? = null
 
     override fun onCreate() {
         super.onCreate()
-        backend = GoBackend(applicationContext)
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        val pm = getSystemService(POWER_SERVICE) as PowerManager
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "rpn:tunnel").apply {
             setReferenceCounted(false)
         }
     }
 
-    override fun onBind(intent: Intent?): IBinder = binder
+    // The system binds with SERVICE_INTERFACE for the VPN; our UI binds otherwise.
+    override fun onBind(intent: Intent?): IBinder? {
+        if (intent?.action == SERVICE_INTERFACE) return super.onBind(intent)
+        return binder
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
-    fun state(): Tunnel.State =
-        try { backend.getState(tunnel) } catch (e: Exception) { Tunnel.State.DOWN }
-
-    /** Brings the tunnel up. Safe to call repeatedly; ignores while already connecting. */
     fun connect() {
-        if (connecting || state() == Tunnel.State.UP) return
+        if (connecting || connected) return
         connecting = true
         lastError = null
         startForegroundCompat()
         if (!wakeLock.isHeld) wakeLock.acquire()
-        onState?.invoke(state())
+        notifyState()
 
         thread(name = "rpn-connect") {
             try {
-                val keys = Keys.load(this)
-                val endpoint = discoverEndpoint()
-                    ?: throw RuntimeException("STUN failed — no public endpoint")
-                val pi = Coordinator.register(
-                    AppConfig.COORDINATOR_URL,
-                    AppConfig.ACCESS_CODE,
-                    keys.publicKey.toBase64(),
-                    endpoint,
-                )
-                Log.i(TAG, "registered: pi=${pi.piEndpoint} vpn=${pi.vpnIp} self=$endpoint")
-                backend.setState(tunnel, Tunnel.State.UP, buildConfig(keys, pi))
+                val priv = Keys.privateKeyB64(this)
+                val pub = Mobile.publicKey(priv)
+                if (pub.isNullOrEmpty()) throw RuntimeException("public key derivation failed")
+
+                val vpnIp = Coordinator.registerVpnIp(AppConfig.COORDINATOR_URL, AppConfig.ACCESS_CODE, pub)
+
+                val builder = Builder()
+                    .addAddress(vpnIp.substringBefore("/"), 32)
+                    .addRoute("0.0.0.0", 0)
+                    .addDnsServer(AppConfig.DNS)
+                    .setMtu(AppConfig.MTU)
+                    .setSession("RPN Direct")
+                // Keep our own traffic (the engine's sockets) OFF the tunnel.
+                try {
+                    builder.addDisallowedApplication(packageName)
+                } catch (e: PackageManager.NameNotFoundException) {
+                    Log.w(TAG, "could not exclude self from VPN", e)
+                }
+
+                val pfd = builder.establish() ?: throw RuntimeException("establish() returned null")
+                tunFd = pfd.detachFd() // Go engine owns the fd from here
+
+                val cfg = JSONObject()
+                    .put("wsURL", AppConfig.WS_URL)
+                    .put("accessCode", AppConfig.ACCESS_CODE)
+                    .put("privateKey", priv)
+                    .put("role", "client")
+                    .put("name", "android")
+                    .toString()
+
+                val err = Mobile.start(cfg, tunFd.toLong())
+                if (!err.isNullOrEmpty()) throw RuntimeException(err)
+                connected = true
+                Log.i(TAG, "engine started; status=${Mobile.status()}")
             } catch (e: Exception) {
                 Log.e(TAG, "connect failed", e)
                 lastError = e.message ?: "unknown error"
-                try { backend.setState(tunnel, Tunnel.State.DOWN, null) } catch (_: Exception) {}
-                releaseAndStop()
+                cleanup()
             } finally {
                 connecting = false
-                onState?.invoke(state())
+                notifyState()
             }
         }
     }
@@ -111,58 +116,34 @@ class RpnService : Service() {
     fun disconnect() {
         thread(name = "rpn-disconnect") {
             try {
-                backend.setState(tunnel, Tunnel.State.DOWN, null)
+                Mobile.stop()
             } catch (e: Exception) {
-                Log.e(TAG, "disconnect failed", e)
-            } finally {
-                releaseAndStop()
-                onState?.invoke(state())
+                Log.e(TAG, "stop failed", e)
             }
+            cleanup()
+            notifyState()
         }
     }
 
-    /**
-     * Bind the exact port WireGuard will use, query STUN, then close so GoBackend
-     * can rebind it. Endpoint-independent (cone) NAT keeps the mapping alive across
-     * the brief close, so the reported endpoint stays valid for WireGuard.
-     */
-    private fun discoverEndpoint(): String? = try {
-        DatagramSocket(null).use { s ->
-            s.reuseAddress = true
-            s.bind(InetSocketAddress(AppConfig.WG_LISTEN_PORT))
-            Stun.reflexive(s, InetSocketAddress(AppConfig.STUN_HOST, AppConfig.STUN_PORT))
-        }
-    } catch (e: Exception) {
-        Log.e(TAG, "STUN error", e); null
+    fun statusText(): String = try { Mobile.status() } catch (e: Exception) { "down" }
+
+    private fun cleanup() {
+        connected = false
+        tunFd = -1
+        if (wakeLock.isHeld) wakeLock.release()
+        stopForegroundCompat()
     }
 
-    private fun buildConfig(keys: KeyPair, pi: PiConfig): Config {
-        val text = """
-            [Interface]
-            PrivateKey = ${keys.privateKey.toBase64()}
-            Address = ${pi.vpnIp}
-            DNS = ${AppConfig.DNS}
-            ListenPort = ${AppConfig.WG_LISTEN_PORT}
+    private fun notifyState() = onState?.invoke()
 
-            [Peer]
-            PublicKey = ${pi.piPubKey}
-            Endpoint = ${pi.piEndpoint}
-            AllowedIPs = 0.0.0.0/0
-            PersistentKeepalive = 5
-        """.trimIndent()
-        return Config.parse(BufferedReader(StringReader(text)))
-    }
-
-    // ── foreground / wakelock plumbing ──────────────────────────────────────────
+    // ── foreground plumbing ─────────────────────────────────────────────────
 
     private fun startForegroundCompat() {
         startForeground(NOTIF_ID, buildNotification())
     }
 
-    private fun releaseAndStop() {
-        if (wakeLock.isHeld) wakeLock.release()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N)
-            stopForeground(STOP_FOREGROUND_REMOVE)
+    private fun stopForegroundCompat() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) stopForeground(STOP_FOREGROUND_REMOVE)
         else @Suppress("DEPRECATION") stopForeground(true)
     }
 
@@ -187,6 +168,7 @@ class RpnService : Service() {
     }
 
     override fun onDestroy() {
+        try { Mobile.stop() } catch (_: Exception) {}
         if (wakeLock.isHeld) wakeLock.release()
         super.onDestroy()
     }

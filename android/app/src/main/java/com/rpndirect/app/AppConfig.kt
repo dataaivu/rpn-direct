@@ -1,40 +1,19 @@
 package com.rpndirect.app
 
 /**
- * Runtime configuration for the direct-path client.
- *
- * The client no longer ships a static WireGuard config. It:
- *   1. Generates/loads its own WG keypair on device.
- *   2. Discovers its public (NAT-mapped) endpoint via STUN, from the *same* UDP
- *      port WireGuard will bind — so the mapping it reports is the one WG reuses.
- *   3. Registers with the coordinator (access code + pubkey + endpoint) and gets
- *      back the assigned Pi's pubkey + live endpoint + the customer's VPN /32.
- *   4. Brings up a WireGuard tunnel that dials the Pi DIRECTLY — the VPS is only
- *      involved in signaling, never in the data path.
- *
- * Direct works because the Pi's Airtel CGNAT is endpoint-independent (cone): once
- * both sides send to each other's mapped endpoints, the port-restricted filter
- * opens and WireGuard's own keepalives hold the path. See airtel-nat-punchable.
+ * Runtime config. The client now embeds the shared Go ICE engine (rpncore .aar):
+ * it registers for a VPN IP, establishes the VpnService tun, and hands the tun fd
+ * to the engine, which connects to the coordinator's WSS, negotiates an ICE path
+ * to the assigned Pi exit, and tunnels WireGuard over it — direct when punchable,
+ * TURN-relay only as last resort. The VPS is not in the data path on the direct
+ * path. See core/ and global-puncher-requirement.
  */
 object AppConfig {
-    const val TUNNEL_NAME = "rpndirect"
-
     const val COORDINATOR_URL = "http://65.20.80.3:8089"
-    const val STUN_HOST = "65.20.80.3"
-    const val STUN_PORT = 3479
-
-    /**
-     * Fixed WireGuard listen port. STUN is queried from this exact port so the
-     * reflexive mapping we report to the coordinator matches the one WireGuard
-     * will reuse when it rebinds the port (endpoint-independent NAT keeps it).
-     */
-    const val WG_LISTEN_PORT = 51820
-
+    const val WS_URL = "ws://65.20.80.3:8089/ws"
     const val DNS = "1.1.1.1"
+    const val MTU = 1420
 
-    /**
-     * Per-install access code. Phase-1 placeholder — replace per device, or wire
-     * a first-run entry screen that stores it in SharedPreferences.
-     */
+    /** Per-install access code. Phase-1 placeholder — set per device. */
     const val ACCESS_CODE = "REPLACE_WITH_ACCESS_CODE"
 }

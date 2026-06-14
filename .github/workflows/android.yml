@@ -2,20 +2,22 @@ name: Build APK
 
 on:
   push:
-    branches: [ master, main ]
+    branches: [ master, main, ice-engine ]
     paths:
       - 'android/**'
+      - 'core/**'
       - '.github/workflows/android.yml'
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: android
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -26,17 +28,45 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install SDK packages
+      - name: Install SDK + NDK packages
         run: |
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools" > /dev/null
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools" "ndk;26.1.10909125" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.1.10909125" >> "$GITHUB_ENV"
 
+      # ── build the shared ICE engine into an .aar (same pins as core.yml) ──
+      - name: Install gomobile (pinned)
+        env:
+          XMOBILE: v0.0.0-20240716161057-1ad2df20a8b6
+        working-directory: core
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@$XMOBILE
+          go install golang.org/x/mobile/cmd/gobind@$XMOBILE
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: gomobile init
+        working-directory: core
+        run: gomobile init
+
+      - name: Pin x/mobile in the module
+        working-directory: core
+        run: go get golang.org/x/mobile@v0.0.0-20240716161057-1ad2df20a8b6
+
+      - name: Build rpncore.aar into app/libs
+        working-directory: core
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/android/app/libs"
+          gomobile bind -androidapi 21 -target=android/arm64,android/arm \
+            -o "$GITHUB_WORKSPACE/android/app/libs/rpncore.aar" ./mobile
+
+      # ── build the APK against the .aar ──
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.7'
 
       - name: Build debug APK
+        working-directory: android
         run: gradle assembleDebug --no-daemon --stacktrace
 
       - name: Upload APK

@@ -10,11 +10,10 @@ import android.os.Bundle
 import android.os.IBinder
 import android.widget.Button
 import android.widget.TextView
-import com.wireguard.android.backend.Tunnel
 
 /**
- * Thin UI. All tunnel state lives in [RpnService] (a foreground service), which
- * outlives this Activity — so connect/disconnect survive the UI being destroyed.
+ * Thin UI. All tunnel state lives in RpnService (a VpnService + foreground
+ * service) which outlives this Activity.
  */
 class MainActivity : Activity() {
 
@@ -26,8 +25,8 @@ class MainActivity : Activity() {
     private val conn = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, b: IBinder?) {
             svc = (b as RpnService.LocalBinder).service
-            svc?.onState = { s -> runOnUiThread { render(s) } }
-            render(svc?.state() ?: Tunnel.State.DOWN)
+            svc?.onState = { runOnUiThread { render() } }
+            render()
             if (pendingConnect) { pendingConnect = false; svc?.connect() }
         }
         override fun onServiceDisconnected(name: ComponentName?) { svc = null }
@@ -45,7 +44,6 @@ class MainActivity : Activity() {
     override fun onStart() {
         super.onStart()
         val i = Intent(this, RpnService::class.java)
-        startService(i)
         bindService(i, conn, Context.BIND_AUTO_CREATE)
     }
 
@@ -57,16 +55,18 @@ class MainActivity : Activity() {
 
     private fun onToggle() {
         val s = svc ?: return
-        if (s.state() == Tunnel.State.UP) { s.disconnect(); return }
-        // Bringing the tunnel up needs the one-time VPN consent dialog.
+        if (s.connected) { s.disconnect(); return }
+        // Starting a VPN needs the one-time consent dialog.
         val prepare = VpnService.prepare(this)
-        if (prepare != null) startActivityForResult(prepare, REQ_VPN) else s.connect()
+        if (prepare != null) startActivityForResult(prepare, REQ_VPN)
+        else { startService(Intent(this, RpnService::class.java)); s.connect() }
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == REQ_VPN) {
             if (resultCode == RESULT_OK) {
+                startService(Intent(this, RpnService::class.java))
                 if (svc != null) svc?.connect() else pendingConnect = true
             } else {
                 status.text = getString(R.string.status_denied)
@@ -74,17 +74,17 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun render(state: Tunnel.State) {
-        val up = state == Tunnel.State.UP
-        val err = svc?.lastError
+    private fun render() {
+        val s = svc
+        val up = s?.connected == true
         status.text = when {
-            svc?.connecting == true -> getString(R.string.status_working)
-            !up && err != null -> getString(R.string.status_error, err)
-            up -> getString(R.string.status_connected)
+            s?.connecting == true -> getString(R.string.status_working)
+            !up && s?.lastError != null -> getString(R.string.status_error, s.lastError)
+            up -> getString(R.string.status_connected) + " — " + (s?.statusText() ?: "")
             else -> getString(R.string.status_disconnected)
         }
         toggle.text = getString(if (up) R.string.btn_disconnect else R.string.btn_connect)
-        toggle.isEnabled = svc?.connecting != true
+        toggle.isEnabled = s?.connecting != true
     }
 
     private companion object { const val REQ_VPN = 1001 }

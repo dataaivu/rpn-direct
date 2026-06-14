@@ -32,22 +32,16 @@
             </intent-filter>
         </activity>
 
-        <!-- WireGuard userspace VpnService provided by the tunnel library (owns the tun fd). -->
-        <service
-            android:name="com.wireguard.android.backend.GoBackend$VpnService"
-            android:exported="false"
-            android:permission="android.permission.BIND_VPN_SERVICE">
-            <intent-filter>
-                <action android:name="android.net.VpnService" />
-            </intent-filter>
-        </service>
-
-        <!-- Our foreground keep-alive service: owns the backend + wakelock, keeps the
-             process alive across screen-off / doze, and survives Activity teardown. -->
+        <!-- Our VpnService + foreground service. Owns the tun fd and the Go ICE
+             engine; survives Activity teardown, screen-off and doze. -->
         <service
             android:name=".RpnService"
             android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE"
             android:foregroundServiceType="specialUse">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="vpn_keepalive" />
